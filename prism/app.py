@@ -57,11 +57,20 @@ class App(object):
 
     def get_customer(self, request):
         subdomain = request.args.get("customer", None)
-        if subdomain is None:
+        if subdomain is None and settings.DOMAIN and request.host:
+            # host = "production-chroma.tryprism.fieldguide.ai"
+            # settings.DOMAIN = "tryprism.fieldguide.ai"
             subdomain = request.host.split("." + settings.DOMAIN)[0]
+            # why is subdomain coming out as "production-chroma.tryprism.fieldguide.ai"
         with sentry_sdk.configure_scope() as scope:
             scope.set_tag("customer", subdomain)
-        customer = self.credentials_store.get_customer(subdomain)
+        try:
+            customer = self.credentials_store.get_customer(subdomain)
+        except KeyError:
+            logger.warning(
+                f"Customer '{subdomain}' not found. Request host: {request.host}"
+            )
+            raise NotFound()
         return customer
 
     def main(self, request):
