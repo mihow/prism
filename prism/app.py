@@ -1,23 +1,24 @@
-import json
-import os.path
-import glob
-import time
 import datetime
+import glob
+import json
 import logging
+import os.path
+import time
+
 import sentry_sdk
+from boto.s3.key import Key
+from requests import HTTPError
 from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
-from werkzeug.wrappers import Request, Response
-from werkzeug.routing import Map, Rule
-from werkzeug.exceptions import HTTPException, NotFound, BadRequest
-from werkzeug.utils import redirect
+from werkzeug.exceptions import BadRequest, HTTPException, NotFound
+
 # from werkzeug.contrib.fixers import ProxyFix
 from werkzeug.middleware.proxy_fix import ProxyFix
-from requests import HTTPError
-from boto.s3.key import Key
+from werkzeug.routing import Map, Rule
+from werkzeug.utils import redirect
+from werkzeug.wrappers import Request, Response
 
 import prism.core as core
 import prism.settings as settings
-
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
@@ -28,16 +29,18 @@ sentry_sdk.init()  # uses SENTRY_DSN env var
 class App(object):
 
     def __init__(self, credentials_store):
-        self.url_map = Map([
-            Rule('/', endpoint='index'),
-            Rule('/elb-health/', endpoint='elb_health_check'),
-            Rule('/test/', endpoint='test'),
-            Rule('/test/info', endpoint='test_info'),
-            Rule('/test/resize', endpoint='test_resize'),
-            Rule('/favicon.ico', endpoint='not_found'),
-            Rule('/robots.txt', endpoint='not_found'),
-            Rule('/setdpr/<dpr>', endpoint='set_dpr'),
-        ])
+        self.url_map = Map(
+            [
+                Rule("/", endpoint="index"),
+                Rule("/elb-health/", endpoint="elb_health_check"),
+                Rule("/test/", endpoint="test"),
+                Rule("/test/info", endpoint="test_info"),
+                Rule("/test/resize", endpoint="test_resize"),
+                Rule("/favicon.ico", endpoint="not_found"),
+                Rule("/robots.txt", endpoint="not_found"),
+                Rule("/setdpr/<dpr>", endpoint="set_dpr"),
+            ]
+        )
         self.credentials_store = credentials_store
 
     def dispatch_request(self, request):
@@ -46,16 +49,16 @@ class App(object):
             try:
                 endpoint, values = adapter.match()
             except NotFound:
-                endpoint = 'main'
+                endpoint = "main"
                 values = {}
             return getattr(self, endpoint)(request, **values)
         except HTTPException as e:
             return e
 
     def get_customer(self, request):
-        subdomain = request.args.get('customer', None)
+        subdomain = request.args.get("customer", None)
         if subdomain is None:
-            subdomain = request.host.split('.' + settings.DOMAIN)[0]
+            subdomain = request.host.split("." + settings.DOMAIN)[0]
         with sentry_sdk.configure_scope() as scope:
             scope.set_tag("customer", subdomain)
         customer = self.credentials_store.get_customer(subdomain)
@@ -64,7 +67,7 @@ class App(object):
     def main(self, request):
         path = request.path[1:]
         _, extension = os.path.splitext(path.lower())
-        if extension not in ('.png', '.jpg', '.jpeg', '.gif', '.webp', ''):
+        if extension not in (".png", ".jpg", ".jpeg", ".gif", ".webp", ""):
             raise NotFound()
         try:
             args = parse_args(path, request)
@@ -72,35 +75,41 @@ class App(object):
             raise BadRequest(e)
 
         customer = self.get_customer(request)
-        if extension == '.gif' and request.args.get('out', 'gif') == 'gif':
+        if extension == ".gif" and request.args.get("out", "gif") == "gif":
             s3_url = core.get_s3_url(
                 customer.read_bucket_name,
                 customer.read_bucket_region,
                 path,
-                endpoint=customer.read_bucket_endpoint_url)
+                endpoint=customer.read_bucket_endpoint_url,
+            )
             if core.check_s3_object_exists(s3_url):
                 return redirect(s3_url)
             raise NotFound()
 
-        if args['command'] == 'info':
+        if args["command"] == "info":
             return info(path, args, customer)
         else:
             return process(path, args, customer)
 
     def index(self, request):
-        return Response('Coming Soon')
+        return Response("Coming Soon")
 
     def not_found(self, request):
         raise NotFound()
 
     def test(self, request):
-        return Response(open('prism/static/test.html'), content_type='text/html')
+        return Response(open("prism/static/test.html"), content_type="text/html")
 
     def elb_health_check(self, request):
         # If HTTPError occurs or can't find the given image gives Response as 500
         customer = self.credentials_store.get_default_customer()
         path = settings.TEST_IMAGE
-        url = core.get_s3_url(customer.read_bucket_name, customer.read_bucket_region, path, endpoint=customer.read_bucket_endpoint_url)
+        url = core.get_s3_url(
+            customer.read_bucket_name,
+            customer.read_bucket_region,
+            path,
+            endpoint=customer.read_bucket_endpoint_url,
+        )
         try:
             if core.check_s3_object_exists(url):
                 return Response("OK")
@@ -117,23 +126,25 @@ class App(object):
         customer = self.credentials_store.get_default_customer()
         print("Customer: ", customer)
         args = {
-            'command': 'resize',
-            'options': {
-                'w': 200,
-                'h': 200,
-                'q': 95,
-                'out_format': 'jpg',
-                'premultiplied_alpha': None,
+            "command": "resize",
+            "options": {
+                "w": 200,
+                "h": 200,
+                "q": 95,
+                "out_format": "jpg",
+                "premultiplied_alpha": None,
             },
-            'no_redirect': True,
-            'debug': True,
+            "no_redirect": True,
+            "debug": True,
         }
         return process(settings.TEST_IMAGE, args, customer)
 
     def set_dpr(self, request, dpr):
         expires = datetime.datetime.utcnow() + datetime.timedelta(days=365)
-        response = Response('var prism_dpr_set=%s;' % dpr, content_type='application/javascript')
-        response.set_cookie('dpr', dpr, expires=expires)
+        response = Response(
+            "var prism_dpr_set=%s;" % dpr, content_type="application/javascript"
+        )
+        response.set_cookie("dpr", dpr, expires=expires)
         return response
 
     def wsgi_app(self, environ, start_response):
@@ -150,7 +161,8 @@ def info(path, args, customer):
         customer.read_bucket_name,
         customer.read_bucket_region,
         path,
-        endpoint=customer.read_bucket_endpoint_url)
+        endpoint=customer.read_bucket_endpoint_url,
+    )
     try:
         im = core.fetch_image(url)
     except HTTPError as e:
@@ -177,18 +189,28 @@ def fetch_image(original_url):
 
 
 def process(path, args, customer):
-    cmd = args['command']
-    options = args['options']
-    original_url = core.get_s3_url(customer.read_bucket_name, customer.read_bucket_region, path, endpoint=customer.read_bucket_endpoint_url)
-    if args['debug']:
+    cmd = args["command"]
+    options = args["options"]
+    original_url = core.get_s3_url(
+        customer.read_bucket_name,
+        customer.read_bucket_region,
+        path,
+        endpoint=customer.read_bucket_endpoint_url,
+    )
+    if args["debug"]:
         im = core.fetch_image(original_url)
         f = core.resize(im, cmd, options)
-        r = Response(f, mimetype='image/jpeg')
+        r = Response(f, mimetype="image/jpeg")
         return r
     result_path = core.get_thumb_filename(path, cmd, options)
-    result_url = core.get_s3_url(customer.write_bucket_name, customer.write_bucket_region, result_path, endpoint=customer.write_bucket_endpoint_url)
+    result_url = core.get_s3_url(
+        customer.write_bucket_name,
+        customer.write_bucket_region,
+        result_path,
+        endpoint=customer.write_bucket_endpoint_url,
+    )
     exists = core.check_s3_object_exists(result_url)
-    if args['with_info'] or args['force'] or not exists:
+    if args["with_info"] or args["force"] or not exists:
         clear_old_tmp_files()
         im = fetch_image(original_url=original_url)
         f = core.resize(im.clone(), cmd, options)
@@ -200,22 +222,22 @@ def process(path, args, customer):
             endpoint_url=customer.write_bucket_endpoint_url,
         )
         core.upload_file(bucket_name, s3_config, f, result_path)
-        if args['with_info']:
+        if args["with_info"]:
             info = core.info(im)
-            info['url'] = result_url
+            info["url"] = result_url
             return json_response(info)
-    if args['no_redirect']:
+    if args["no_redirect"]:
         r = Response()
         # Tell nginx to serve the url for us
         # https://www.nginx.com/resources/wiki/start/topics/examples/x-accel/#x-accel-redirect
-        r.headers['X-Accel-Redirect'] = '/s3/' + result_url.split('https://')[1]
+        r.headers["X-Accel-Redirect"] = "/s3/" + result_url.split("https://")[1]
         return r
     else:
         return redirect(result_url)
 
 
 def make_bool(x):
-    if x.lower() in ('false', '0'):
+    if x.lower() in ("false", "0"):
         return False
     else:
         return True
@@ -229,62 +251,66 @@ def int_or_none(x):
 
 
 def get_command(args):
-    commands = ('resize',
-                'resize_then_crop',
-                'resize_then_fit',
-                'info',
-                'smart_crop',
-                'requeue',
-                'invalidate')
+    commands = (
+        "resize",
+        "resize_then_crop",
+        "resize_then_fit",
+        "info",
+        "smart_crop",
+        "requeue",
+        "invalidate",
+    )
 
-    command = args.get('cmd', 'resize')
+    command = args.get("cmd", "resize")
     if command not in commands:
-        raise Exception('Error: parameter is wrong - command')
+        raise Exception("Error: parameter is wrong - command")
     return command
 
 
 def get_dimensions(args, command):
     max_dimension = 10000
-    if args.get('premultiplied'):
+    if args.get("premultiplied"):
         # We use a smaller max_dimension in this case because convert_to_premultiplied_png needs to make an in-memory copy
         max_dimension = 4000
-    width = args.get('w', args.get('width', None))
-    height = args.get('h', args.get('height', None))
+    width = args.get("w", args.get("width", None))
+    height = args.get("h", args.get("height", None))
     if width:
         try:
             width = int(width)
         except Exception:
-            raise Exception('width or height is not an integer')
+            raise Exception("width or height is not an integer")
         if width > max_dimension:
-            raise Exception(f'width should be < {max_dimension}')
+            raise Exception(f"width should be < {max_dimension}")
 
     if height:
         try:
             height = int(height)
         except Exception:
-            raise Exception('width or height is not an integer')
+            raise Exception("width or height is not an integer")
         if height > max_dimension:
-            raise Exception(f'height should be < {max_dimension}')
+            raise Exception(f"height should be < {max_dimension}")
 
-    if command == 'resize':
+    if command == "resize":
         if not (width or height):
-            raise Exception('width or height is required')
-    elif command in ('resize_then_crop', 'resize_then_fit'):
+            raise Exception("width or height is required")
+    elif command in ("resize_then_crop", "resize_then_fit"):
         if not (width and height):
-            raise Exception('width and height is required')
+            raise Exception("width and height is required")
     return width, height
 
 
 def get_output_format(default_out_format, command, args, accepted_formats):
-    if command == 'resize_then_fit':
-        default_out_format = 'png'
-    if 'out' in args and args['out']:
-        out_format = args['out'].lower()
-        if out_format not in ('jpg', 'jpeg', 'png', 'webp'):
-            raise Exception('Error 111 - image format should be jpg, png or webp: %s' % out_format)
-    elif 'image/webp' in accepted_formats:
+    if command == "resize_then_fit":
+        default_out_format = "png"
+    if "out" in args and args["out"]:
+        out_format = args["out"].lower()
+        if out_format not in ("jpg", "jpeg", "png", "webp"):
+            raise Exception(
+                "Error 111 - image format should be jpg, png or webp: %s" % out_format
+            )
+    elif "image/webp" in accepted_formats:
         # we only force webp if the browser supports it && the url doesn't specify an out format
-        out_format = 'webp'
+        out_format = "webp"
     else:
         out_format = default_out_format
     return out_format
@@ -299,7 +325,7 @@ def make_retina(width, height, dpr):
 
 
 def convert_filters_to_json(args):
-    filters = args.get('filters', None)
+    filters = args.get("filters", None)
     if filters:
         # we need filter as json data, because every filter can have N parameters.
         try:
@@ -313,7 +339,7 @@ def get_opacity(command, args):
     default_opacity = 100
     # this is to replicate a bug in the original version
     # opacity argument is ignored
-    if command == 'resize_then_crop' or args.get('out') == 'jpg':
+    if command == "resize_then_crop" or args.get("out") == "jpg":
         default_opacity = 0
     # options['opacity'] = args.get('opacity', default_opacity)
     return default_opacity
@@ -327,49 +353,54 @@ def parse_args(path, request):
     _, extension = os.path.splitext(path)
 
     command = get_command(args=args)
-    options['resize_then_crop'] = int(args.get('resize_then_crop', '0'))
-    if options['resize_then_crop']:
-        command = 'resize_then_crop'
+    options["resize_then_crop"] = int(args.get("resize_then_crop", "0"))
+    if options["resize_then_crop"]:
+        command = "resize_then_crop"
 
     width, height = get_dimensions(args=args, command=command)
 
-    retina = make_bool(args.get('retina', 'false'))
-    if retina and 'dpr' in request.cookies:
-        width, height = make_retina(width, height, request.cookies['dpr'])
+    retina = make_bool(args.get("retina", "false"))
+    if retina and "dpr" in request.cookies:
+        width, height = make_retina(width, height, request.cookies["dpr"])
 
-    options['w'] = width
-    options['h'] = height
-    options['preserve_ratio'] = make_bool(args.get('preserve_ratio', 'true'))
-    options['crop_x'] = args.get('crop_x', None)
-    options['crop_y'] = args.get('crop_y', None)
-    options['crop_width'] = args.get('crop_width', None)
-    options['crop_height'] = args.get('crop_height', None)
-    options['frame_bg_color'] = args.get('frame_bg_color', 'FFF')
-    options['gravity'] = args.get('gravity', 'center')
-    options['premultiplied_alpha'] = args.get('premultiplied', None)
-    options['q'] = int(args.get('quality', '95'))
-    options['opacity'] = get_opacity(command=command, args=args, )
-    options['filters'] = convert_filters_to_json(args=args)
-    options['out_format'] = get_output_format(default_out_format=extension[1:],
-                                              command=command,
-                                              args=args,
-                                              accepted_formats=request.headers.get('accept', ''))
+    options["w"] = width
+    options["h"] = height
+    options["preserve_ratio"] = make_bool(args.get("preserve_ratio", "true"))
+    options["crop_x"] = args.get("crop_x", None)
+    options["crop_y"] = args.get("crop_y", None)
+    options["crop_width"] = args.get("crop_width", None)
+    options["crop_height"] = args.get("crop_height", None)
+    options["frame_bg_color"] = args.get("frame_bg_color", "FFF")
+    options["gravity"] = args.get("gravity", "center")
+    options["premultiplied_alpha"] = args.get("premultiplied", None)
+    options["q"] = int(args.get("quality", "95"))
+    options["opacity"] = get_opacity(
+        command=command,
+        args=args,
+    )
+    options["filters"] = convert_filters_to_json(args=args)
+    options["out_format"] = get_output_format(
+        default_out_format=extension[1:],
+        command=command,
+        args=args,
+        accepted_formats=request.headers.get("accept", ""),
+    )
 
-    new_args['options'] = options
-    new_args['command'] = command
-    new_args['with_info'] = args.get('with_info', False)
-    new_args['no_redirect'] = make_bool(args.get('no_redirect', '0'))
-    new_args['debug'] = make_bool(args.get('debug', '0'))
-    new_args['force'] = make_bool(args.get('force', '0'))
+    new_args["options"] = options
+    new_args["command"] = command
+    new_args["with_info"] = args.get("with_info", False)
+    new_args["no_redirect"] = make_bool(args.get("no_redirect", "0"))
+    new_args["debug"] = make_bool(args.get("debug", "0"))
+    new_args["force"] = make_bool(args.get("force", "0"))
     return new_args
 
 
 def json_response(data):
-    return Response(json.dumps(data), content_type='application/json')
+    return Response(json.dumps(data), content_type="application/json")
 
 
 def clear_old_tmp_files():
-    tmp_files = glob.glob('/tmp/magick-*')
+    tmp_files = glob.glob("/tmp/magick-*")
     now = time.time()
     for tmp_file in tmp_files:
         try:
@@ -381,18 +412,20 @@ def clear_old_tmp_files():
 
 
 class Customer(object):
-    def __init__(self,
-                 read_bucket_name=None,
-                 read_bucket_key_id=None,
-                 read_bucket_secret_key=None,
-                 read_bucket_region=None,
-                 read_bucket_endpoint_url=None,
-                 write_bucket_name=None,
-                 write_bucket_key_id=None,
-                 write_bucket_secret_key=None,
-                 write_bucket_region=None,
-                 write_bucket_endpoint_url=None,
-                 **kwargs):
+    def __init__(
+        self,
+        read_bucket_name=None,
+        read_bucket_key_id=None,
+        read_bucket_secret_key=None,
+        read_bucket_region=None,
+        read_bucket_endpoint_url=None,
+        write_bucket_name=None,
+        write_bucket_key_id=None,
+        write_bucket_secret_key=None,
+        write_bucket_region=None,
+        write_bucket_endpoint_url=None,
+        **kwargs,
+    ):
         self.read_bucket_name = read_bucket_name
         self.read_bucket_key_id = read_bucket_key_id
         self.read_bucket_secret_key = read_bucket_secret_key
@@ -402,7 +435,9 @@ class Customer(object):
         self.write_bucket_key_id = write_bucket_key_id or read_bucket_key_id
         self.write_bucket_secret_key = write_bucket_secret_key or read_bucket_secret_key
         self.write_bucket_region = write_bucket_region or read_bucket_region
-        self.write_bucket_endpoint_url = write_bucket_endpoint_url or read_bucket_endpoint_url
+        self.write_bucket_endpoint_url = (
+            write_bucket_endpoint_url or read_bucket_endpoint_url
+        )
 
 
 class CredentialsStore(object):
@@ -413,17 +448,22 @@ class CredentialsStore(object):
         self.expiration_time = None
 
     def _get_credentials(self):
-        if not self.customers_credentials or self.expiration_time < datetime.datetime.now():
-            logger.info('Loading credentials from %s', self.bucket_name)
+        if (
+            not self.customers_credentials
+            or self.expiration_time < datetime.datetime.now()
+        ):
+            logger.info("Loading credentials from %s", self.bucket_name)
             # Get the credentials from the private secrets bucket.
             # Boto authenticates using the IAM role assigned to the ec2 instances.
             try:
                 s3_config = core.S3ConnectionConfig()
                 s3 = core.get_s3_client(s3_config)
                 bucket = s3.get_bucket(self.bucket_name, validate=False)
-                k = Key(bucket, 'credentials.json')
+                k = Key(bucket, "credentials.json")
                 self.customers_credentials = json.loads(k.get_contents_as_string())
-                self.expiration_time = datetime.datetime.now() + datetime.timedelta(minutes=5)
+                self.expiration_time = datetime.datetime.now() + datetime.timedelta(
+                    minutes=5
+                )
             except Exception:
                 logger.exception("Exception while getting customer credentials")
                 sentry_sdk.capture_exception()
@@ -456,18 +496,22 @@ class SingleCustomerCredentialsStore(object):
 
 
 if settings.MULTI_CUSTOMER_MODE:
-    credentials_store = CredentialsStore(bucket=settings.SECRETS_BUCKET, default_customer=settings.DEFAULT_CUSTOMER)
+    credentials_store = CredentialsStore(
+        bucket=settings.SECRETS_BUCKET, default_customer=settings.DEFAULT_CUSTOMER
+    )
 elif settings.S3_BUCKET:
-    credentials_store = SingleCustomerCredentialsStore({
+    credentials_store = SingleCustomerCredentialsStore(
+        {
             "read_bucket_name": settings.S3_BUCKET,
             "read_bucket_region": settings.AWS_REGION,
             "read_bucket_key_id": settings.AWS_ACCESS_KEY_ID,
             "read_bucket_secret_key": settings.AWS_SECRET_ACCESS_KEY,
             "read_bucket_endpoint_url": settings.S3_ENDPOINT_URL,
             "write_bucket_name": settings.S3_WRITE_BUCKET or settings.S3_BUCKET,
-        })
+        }
+    )
 else:
-    raise Exception('S3_BUCKET must be set if MULTI_CUSTOMER_MODE is not true')
+    raise Exception("S3_BUCKET must be set if MULTI_CUSTOMER_MODE is not true")
 
 app = App(credentials_store=credentials_store)
 app = SentryWsgiMiddleware(app)
