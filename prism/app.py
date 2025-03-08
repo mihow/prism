@@ -4,6 +4,7 @@ import json
 import logging
 import os.path
 import time
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 import sentry_sdk
 from boto.s3.key import Key
@@ -81,7 +82,7 @@ class App(object):
         try:
             args = parse_args(path, request)
         except Exception as e:
-            raise BadRequest(e)
+            raise BadRequest(str(e))
 
         customer = self.get_customer(request)
         if extension == ".gif" and request.args.get("out", "gif") == "gif":
@@ -457,9 +458,9 @@ class CredentialsStore(object):
         self.expiration_time = None
 
     def _get_credentials(self):
-        if (
-            not self.customers_credentials
-            or self.expiration_time < datetime.datetime.now()
+        if not self.customers_credentials or (
+            self.expiration_time is not None
+            and self.expiration_time < datetime.datetime.now()
         ):
             logger.info("Loading credentials from %s", self.bucket_name)
             # Get the credentials from the private secrets bucket.
@@ -480,7 +481,7 @@ class CredentialsStore(object):
                 # s3 may be unavailable or the new credentials may be unparsable
                 # so we extend the timeout by a minute instead of continuously requesting
                 # and waiting on every request
-                if self.customers_credentials:
+                if self.customers_credentials and self.expiration_time is not None:
                     self.expiration_time += datetime.timedelta(minutes=1)
                     return self.customers_credentials
         return self.customers_credentials
@@ -506,7 +507,8 @@ class SingleCustomerCredentialsStore(object):
 
 if settings.MULTI_CUSTOMER_MODE:
     credentials_store = CredentialsStore(
-        bucket=settings.SECRETS_BUCKET, default_customer=settings.DEFAULT_CUSTOMER
+        bucket=settings.SECRETS_BUCKET or "",
+        default_customer=settings.DEFAULT_CUSTOMER or "",
     )
 elif settings.S3_BUCKET:
     credentials_store = SingleCustomerCredentialsStore(
