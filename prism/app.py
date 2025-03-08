@@ -524,8 +524,51 @@ elif settings.S3_BUCKET:
 else:
     raise Exception("S3_BUCKET must be set if MULTI_CUSTOMER_MODE is not true")
 
+
+class CORSMiddleware:
+    """
+    WSGI middleware that adds CORS headers to responses.
+    Equivalent to the CORS configuration in nginx-sample.conf.
+    """
+
+    def __init__(self, app: Callable) -> None:
+        self.app = app
+        # CORS headers based on nginx-sample.conf
+        self.cors_headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+            "Access-Control-Allow-Headers": "cache-control, content-range, accept, origin, session-id, content-disposition, x-requested-with, content-type, content-description, referer, user-agent",
+            "Access-Control-Allow-Credentials": "true",
+            "Access-Control-Max-Age": "600",  # 10 minute pre-flight approval
+            "Vary": "accept",
+        }
+
+    def __call__(self, environ: Dict, start_response: Callable) -> Iterable[bytes]:
+        # Handle OPTIONS requests for CORS preflight
+        if environ.get("REQUEST_METHOD") == "OPTIONS":
+            response = Response("", status=200)
+            for key, value in self.cors_headers.items():
+                response.headers[key] = value
+            return response(environ, start_response)
+
+        # For all other requests, call the wrapped app and add CORS headers to the response
+        def cors_start_response(
+            status: str,
+            headers: List[Tuple[str, str]],
+            exc_info: Optional[Exception] = None,
+        ) -> Callable:
+            # Add CORS headers to the response
+            cors_headers = [(key, value) for key, value in self.cors_headers.items()]
+            headers.extend(cors_headers)
+            return start_response(status, headers, exc_info)
+
+        return self.app(environ, cors_start_response)
+
+
 app = App(credentials_store=credentials_store)
 app = SentryWsgiMiddleware(app)
+# Add CORS middleware
+app = CORSMiddleware(app)
 # ProxyFix reads the X-Forwarded-* headers set by proxies (like ELB)
 # and updates the request so things like request.scheme is correct.
 app = ProxyFix(app)
