@@ -210,7 +210,7 @@ def process(path, args, customer):
     if args["debug"]:
         im = core.fetch_image(original_url)
         f = core.resize(im, cmd, options)
-        r = Response(f, mimetype="image/jpeg")
+        r = Response(f, mimetype="image/jpeg", direct_passthrough=True)
         return r
     result_path = core.get_thumb_filename(path, cmd, options)
     result_url = core.get_s3_url(
@@ -248,6 +248,11 @@ def process(path, args, customer):
         # https://www.nginx.com/resources/wiki/start/topics/examples/x-accel/#x-accel-redirect
         r.headers["X-Accel-Redirect"] = "/s3/" + result_url.split("https://")[1]
         return r
+    if args["no_redirect_uwsgi"]:
+        # Serve the image directly from the uWSGI server for testing.
+        im = fetch_image(result_url)
+        # send_file requires an environ object which we don't have here.
+        return Response(im, mimetype="image/*", direct_passthrough=True)
     else:
         return redirect(result_url)
 
