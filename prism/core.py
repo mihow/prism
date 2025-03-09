@@ -13,7 +13,7 @@ from io import BytesIO
 from boto.s3.key import Key
 from wand.image import Image
 
-from prism.image import ImageOperator, convert_to_premultiplied_png
+from prism.image import ImageOperator, convert_to_premultiplied_png, create_progressive_jpeg
 
 
 logger = logging.getLogger(__name__)
@@ -67,14 +67,25 @@ def resize(img, cmd, options):
             fn_filter = getattr(imop, filter['id'])
 
             t = {}
-            for k, v in filter.iteritems():
+            for k, v in filter.items():  # Changed from iteritems() to items() for Python 3
                 t[k.replace('-', '_')] = v
             fn_filter(**t)
 
     imop.image.compression_quality = options['q']
-    f = BytesIO()
-    imop.write(f, options['out_format'])
-    f.seek(0)
+    
+    # Check if we should use progressive JPEG
+    use_progressive = options.get('progressive', False)
+    out_format = options['out_format']
+    
+    if use_progressive and out_format.lower() in ('jpg', 'jpeg'):
+        # Use progressive JPEG encoding
+        logging.info("Using progressive JPEG encoding with quality %s", options['q'])
+        f = create_progressive_jpeg(imop.image, quality=options['q'])
+    else:
+        # Use standard encoding
+        f = BytesIO()
+        imop.write(f, out_format)
+        f.seek(0)
 
     if options['premultiplied_alpha']:
         f = convert_to_premultiplied_png(f)
@@ -104,6 +115,7 @@ def get_thumb_filename(file_name, cmd, options):
         'preserve_ratio': True,
         'premultiplied_alpha': None,
         'filters': None,
+        'progressive': True,
     }
 
     params = []
