@@ -143,6 +143,7 @@ class App(object):
                 "q": 95,
                 "out_format": "jpg",
                 "premultiplied_alpha": None,
+                "progressive": True,  # Enable progressive JPEG for test
             },
             "no_redirect": True,
             "debug": True,
@@ -384,6 +385,7 @@ def parse_args(path, request):
     options["gravity"] = args.get("gravity", "center")
     options["premultiplied_alpha"] = args.get("premultiplied", None)
     options["q"] = int(args.get("quality", "95"))
+    options["progressive"] = make_bool(args.get("progressive", "true"))
     options["opacity"] = get_opacity(
         command=command,
         args=args,
