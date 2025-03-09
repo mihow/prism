@@ -237,6 +237,12 @@ def process(path, args, customer):
             info["url"] = result_url
             return json_response(info)
     if args["no_redirect"]:
+        # Caveat! The published iOS app uses no_redirect=1 to serve the image directly.
+        # however without NGINX this is no longer possible. So we are forcing a redirect.
+        # Use the `debug` url param to prevent the redirect when testing.
+        logger.warning("Forcing redirect even though no_redirect is set")
+        return redirect(result_url)
+    if args["no_redirect_nginx"]:
         r = Response()
         # Tell nginx to serve the url for us
         # https://www.nginx.com/resources/wiki/start/topics/examples/x-accel/#x-accel-redirect
@@ -400,6 +406,8 @@ def parse_args(path, request):
     new_args["command"] = command
     new_args["with_info"] = args.get("with_info", False)
     new_args["no_redirect"] = make_bool(args.get("no_redirect", "0"))
+    new_args["no_redirect_nginx"] = make_bool(args.get("no_redirect_nginx", "0"))
+    new_args["no_redirect_uwsgi"] = make_bool(args.get("no_redirect_uwsgi", "0"))
     new_args["debug"] = make_bool(args.get("debug", "0"))
     new_args["force"] = make_bool(args.get("force", "0"))
     return new_args
