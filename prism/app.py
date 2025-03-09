@@ -210,7 +210,7 @@ def process(path, args, customer):
     if args["debug"]:
         im = core.fetch_image(original_url)
         f = core.resize(im, cmd, options)
-        r = Response(f, mimetype="image/jpeg")
+        r = Response(f, mimetype="image/jpeg", direct_passthrough=True)
         return r
     result_path = core.get_thumb_filename(path, cmd, options)
     result_url = core.get_s3_url(
@@ -237,11 +237,22 @@ def process(path, args, customer):
             info["url"] = result_url
             return json_response(info)
     if args["no_redirect"]:
+        # Caveat! The published iOS app uses no_redirect=1 to serve the image directly.
+        # however without NGINX this is no longer possible. So we are forcing a redirect.
+        # Use the `debug` url param to prevent the redirect when testing.
+        logger.warning("Forcing redirect even though no_redirect is set")
+        return redirect(result_url)
+    if args["no_redirect_nginx"]:
         r = Response()
         # Tell nginx to serve the url for us
         # https://www.nginx.com/resources/wiki/start/topics/examples/x-accel/#x-accel-redirect
         r.headers["X-Accel-Redirect"] = "/s3/" + result_url.split("https://")[1]
         return r
+    if args["no_redirect_uwsgi"]:
+        # Serve the image directly from the uWSGI server for testing.
+        im = fetch_image(result_url)
+        # send_file requires an environ object which we don't have here.
+        return Response(im, mimetype="image/*", direct_passthrough=True)
     else:
         return redirect(result_url)
 
@@ -400,6 +411,8 @@ def parse_args(path, request):
     new_args["command"] = command
     new_args["with_info"] = args.get("with_info", False)
     new_args["no_redirect"] = make_bool(args.get("no_redirect", "0"))
+    new_args["no_redirect_nginx"] = make_bool(args.get("no_redirect_nginx", "0"))
+    new_args["no_redirect_uwsgi"] = make_bool(args.get("no_redirect_uwsgi", "0"))
     new_args["debug"] = make_bool(args.get("debug", "0"))
     new_args["force"] = make_bool(args.get("force", "0"))
     return new_args
