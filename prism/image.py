@@ -4,8 +4,45 @@ from wand.color import Color
 from PIL import Image as Img
 import numpy
 import logging
+from typing import Optional, BinaryIO, Tuple, List, Union, Dict, Any
 
 logger = logging.getLogger(__name__)
+
+
+def create_progressive_jpeg(image: Image, quality: int = 80) -> BytesIO:
+    """
+    Creates a progressive JPEG from the given image.
+    
+    Progressive JPEGs load in multiple passes, starting with a low-quality version
+    and gradually improving in quality as more data is loaded. This provides a better
+    user experience as users can see something immediately rather than waiting for
+    the full image to load.
+    
+    Args:
+        image: The Wand Image object to convert
+        quality: JPEG compression quality (1-100)
+        
+    Returns:
+        BytesIO object containing the progressive JPEG data
+    """
+    # Clone the image to avoid modifying the original
+    img_copy = image.clone()
+    
+    # Set the interlace scheme to "plane" for progressive JPEGs
+    img_copy.options['jpeg:interlace'] = 'plane'
+    
+    # Set compression quality
+    img_copy.compression_quality = quality
+    
+    # Convert to JPEG format if it's not already
+    img_copy.format = 'jpeg'
+    
+    # Save to BytesIO
+    f = BytesIO()
+    img_copy.save(file=f)
+    f.seek(0)
+    
+    return f
 
 
 class ImageOperator(object):
@@ -371,13 +408,13 @@ class ImageOperator(object):
 
         logger.info("converting to premultiplied alpha")
         im = Img.open(file_name).convert('RGBA')
-        a = numpy.fromstring(im.tostring(), dtype=numpy.uint8)
+        a = numpy.frombuffer(im.tobytes(), dtype=numpy.uint8)
         alpha_layer = a[3::4] / 255.0
         a[::4] *= alpha_layer
         a[1::4] *= alpha_layer
         a[2::4] *= alpha_layer
 
-        im = Img.fromstring("RGBA", im.size, a.tostring())
+        im = Img.frombytes("RGBA", im.size, a.tobytes())
         im.save(file_name)
 
     def smart_crop(self, file_name, wanted_width, wanted_height, **kwargs):
@@ -391,13 +428,13 @@ def convert_to_premultiplied_png(file):
     """
     logger.info("converting to premultiplied alpha")
     im = Img.open(file).convert('RGBA')
-    a = numpy.fromstring(im.tobytes(), dtype=numpy.uint8)
+    a = numpy.frombuffer(im.tobytes(), dtype=numpy.uint8)
     a = a.astype(numpy.float64)
     alpha_layer = a[3::4] / 255.0
     a[::4] *= alpha_layer
     a[1::4] *= alpha_layer
     a[2::4] *= alpha_layer
-    im = Img.frombytes("RGBA", im.size, a.astype(numpy.uint8).tostring())
+    im = Img.frombytes("RGBA", im.size, a.astype(numpy.uint8).tobytes())
     f = BytesIO()
     im.save(f, 'png')
     f.seek(0)
