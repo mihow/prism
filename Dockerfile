@@ -5,11 +5,12 @@ RUN apt-get update
 RUN apt-get install webp -y
 
 # This specific version of ImageMagick is required for compatibility with Wand
-RUN wget https://download.imagemagick.org/archive/releases/ImageMagick-6.9.10-90.tar.xz && \
-tar -xvf ImageMagick-6.9.10-90.tar.xz && \
-cd ImageMagick-6.9.10-90 && \
+# Fetched from the GitHub release tag; the imagemagick.org download hosts have moved and refuse connections at times.
+RUN wget -O ImageMagick-6.9.10-90.tar.gz https://github.com/ImageMagick/ImageMagick6/archive/refs/tags/6.9.10-90.tar.gz && \
+tar -xzf ImageMagick-6.9.10-90.tar.gz && \
+cd ImageMagick6-6.9.10-90 && \
 ./configure --with-webp=yes && \
-make && \
+make -j"$(nproc)" && \
 make install && \
 ldconfig /usr/local/lib
 
