@@ -206,14 +206,16 @@ def get_s3_url(bucket_name, bucket_region, path, endpoint=None):
     return url
 
 
-def get_signed_s3_url(bucket_name: str, path: str, s3_config: S3ConnectionConfig, expires_in: int = 300) -> str:
-    """Get a short-lived signed GET URL for an object in a private bucket.
+def get_signed_s3_url(bucket_name: str, path: str, s3_config: S3ConnectionConfig, method: str = 'GET', expires_in: int = 300) -> str:
+    """Get a short-lived signed URL for an object in a private bucket.
 
     Private buckets (for example a Ceph bucket without public-read) return 403 or 404 to the
-    anonymous GET that fetch_image makes, so their originals must be fetched with a signed URL.
+    anonymous requests that fetch_image and check_s3_object_exists make, so their originals
+    must be read with a signed URL. The signature covers the HTTP method, so a URL signed for
+    GET cannot be used for HEAD.
     """
     conn = get_s3_client(s3_config)
-    return conn.generate_url(expires_in, 'GET', bucket=bucket_name, key=path.lstrip('/'))
+    return conn.generate_url(expires_in, method, bucket=bucket_name, key=path.lstrip('/'))
 
 
 def fetch_image(url):

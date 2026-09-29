@@ -125,6 +125,11 @@ class TestOriginUrls(unittest.TestCase):
         self.assertIn("Signature", urllib.parse.parse_qs(signed.query))
         self.assertEqual(fallback.url(PATH), "https://s3.amazonaws.com/fallback/" + PATH)
 
+    def test_head_requests_get_their_own_signature(self):
+        primary = make_customer().origins()[0]
+        signature = lambda url: urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["Signature"]  # noqa: E731
+        self.assertNotEqual(signature(primary.url(PATH)), signature(primary.url(PATH, method="HEAD")))
+
     def test_write_bucket_defaults_are_unchanged(self):
         customer = Customer(read_bucket_name="originals", read_bucket_region="us-east-1")
         self.assertEqual(customer.write_bucket_name, "originals")

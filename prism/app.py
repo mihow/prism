@@ -87,9 +87,8 @@ class App(object):
         customer = self.get_customer(request)
         if extension == ".gif" and request.args.get("out", "gif") == "gif":
             for origin in customer.origins():
-                s3_url = origin.url(path)
-                if core.check_s3_object_exists(s3_url):
-                    return redirect(s3_url)
+                if core.check_s3_object_exists(origin.url(path, method="HEAD")):
+                    return redirect(origin.url(path))
             raise NotFound()
 
         if args["command"] == "info":
@@ -109,7 +108,7 @@ class App(object):
     def elb_health_check(self, request):
         # If HTTPError occurs or can't find the given image gives Response as 500
         customer = self.credentials_store.get_default_customer()
-        url = customer.origins()[0].url(settings.TEST_IMAGE)
+        url = customer.origins()[0].url(settings.TEST_IMAGE, method="HEAD")
         try:
             if core.check_s3_object_exists(url):
                 return Response("OK")
@@ -533,7 +532,7 @@ class Origin(object):
         self.secret_key = secret_key
         self.private = private
 
-    def url(self, path):
+    def url(self, path, method="GET"):
         if self.private:
             s3_config = core.S3ConnectionConfig(
                 key_id=self.key_id,
@@ -541,7 +540,7 @@ class Origin(object):
                 region=self.region,
                 endpoint_url=self.endpoint_url,
             )
-            return core.get_signed_s3_url(self.bucket_name, path, s3_config)
+            return core.get_signed_s3_url(self.bucket_name, path, s3_config, method=method)
         return core.get_s3_url(self.bucket_name, self.region, path, endpoint=self.endpoint_url)
 
 
