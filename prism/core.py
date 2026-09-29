@@ -206,10 +206,20 @@ def get_s3_url(bucket_name, bucket_region, path, endpoint=None):
     return url
 
 
+def get_signed_s3_url(bucket_name: str, path: str, s3_config: S3ConnectionConfig, expires_in: int = 300) -> str:
+    """Get a short-lived signed GET URL for an object in a private bucket.
+
+    Private buckets (for example a Ceph bucket without public-read) return 403 or 404 to the
+    anonymous GET that fetch_image makes, so their originals must be fetched with a signed URL.
+    """
+    conn = get_s3_client(s3_config)
+    return conn.generate_url(expires_in, 'GET', bucket=bucket_name, key=path.lstrip('/'))
+
+
 def fetch_image(url):
     s = requests.Session()
     s.mount('https://', HTTPAdapter(max_retries=retries))
-    print(f"Fetching {url}")
+    print(f"Fetching {url.split('?')[0]}")  # the query string may hold a signature
     r = s.get(url, timeout=5.0)
     t = r.elapsed.total_seconds()
     logging.info('S3 GET request time: %0.2f', t)

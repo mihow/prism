@@ -21,7 +21,7 @@ from werkzeug.wrappers import Request, Response
 import prism.core as core
 import prism.settings as settings
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "WARNING").upper())
 logger = logging.getLogger(__name__)
 
 sentry_sdk.init()  # uses SENTRY_DSN env var
@@ -86,14 +86,10 @@ class App(object):
 
         customer = self.get_customer(request)
         if extension == ".gif" and request.args.get("out", "gif") == "gif":
-            s3_url = core.get_s3_url(
-                customer.read_bucket_name,
-                customer.read_bucket_region,
-                path,
-                endpoint=customer.read_bucket_endpoint_url,
-            )
-            if core.check_s3_object_exists(s3_url):
-                return redirect(s3_url)
+            for origin in customer.origins():
+                s3_url = origin.url(path)
+                if core.check_s3_object_exists(s3_url):
+                    return redirect(s3_url)
             raise NotFound()
 
         if args["command"] == "info":
@@ -113,13 +109,7 @@ class App(object):
     def elb_health_check(self, request):
         # If HTTPError occurs or can't find the given image gives Response as 500
         customer = self.credentials_store.get_default_customer()
-        path = settings.TEST_IMAGE
-        url = core.get_s3_url(
-            customer.read_bucket_name,
-            customer.read_bucket_region,
-            path,
-            endpoint=customer.read_bucket_endpoint_url,
-        )
+        url = customer.origins()[0].url(settings.TEST_IMAGE)
         try:
             if core.check_s3_object_exists(url):
                 return Response("OK")
@@ -167,19 +157,7 @@ class App(object):
 
 
 def info(path, args, customer):
-    url = core.get_s3_url(
-        customer.read_bucket_name,
-        customer.read_bucket_region,
-        path,
-        endpoint=customer.read_bucket_endpoint_url,
-    )
-    try:
-        im = core.fetch_image(url)
-    except HTTPError as e:
-        if e.response.status_code in (404, 403):
-            raise NotFound()
-        else:
-            raise
+    im = fetch_original(path, customer)
     info = core.info(im)
     return json_response(info)
 
@@ -198,17 +176,50 @@ def fetch_image(original_url):
         raise BadRequest(e.message)
 
 
+def fetch_original(path, customer):
+    """Fetch an original image, trying the customer's origins in order.
+
+    The next origin is tried only when the current one does not have a usable copy of the
+    file: it is missing, empty, or not a valid image (an interrupted copy). Any other failure,
+    such as a 5xx or a credentials error on a private bucket, is raised, so that a broken
+    primary origin shows up as errors instead of quietly moving all traffic to the fallback.
+    Each fetch logs which origin served the original, which is how the size of the gap
+    between the primary and the fallback bucket is measured.
+    """
+    origins = customer.origins()
+    for i, origin in enumerate(origins):
+        is_last = i == len(origins) - 1
+        try:
+            im = core.fetch_image(origin.url(path))
+        except HTTPError as e:
+            status = e.response.status_code
+            # Anonymous S3 requests get 403 for a missing key when the caller may not list the
+            # bucket, so 403 means "missing" only for public origins. For a private origin
+            # it means our credentials were refused.
+            if status == 404 or (status == 403 and not origin.private):
+                miss_reason = str(status)
+            else:
+                raise
+        except core.EmptyOriginalFile as e:
+            if is_last:
+                raise BadRequest(e.message)
+            miss_reason = "empty"
+        except core.InvalidImageError as e:
+            if is_last:
+                raise BadRequest(e.message)
+            miss_reason = "invalid"
+        else:
+            logger.info("original served by origin=%s bucket=%s path=%s", origin.name, origin.bucket_name, path)
+            return im
+        logger.info("original missing on origin=%s bucket=%s reason=%s path=%s", origin.name, origin.bucket_name, miss_reason, path)
+    raise NotFound()
+
+
 def process(path, args, customer):
     cmd = args["command"]
     options = args["options"]
-    original_url = core.get_s3_url(
-        customer.read_bucket_name,
-        customer.read_bucket_region,
-        path,
-        endpoint=customer.read_bucket_endpoint_url,
-    )
     if args["debug"]:
-        im = core.fetch_image(original_url)
+        im = fetch_original(path, customer)
         f = core.resize(im, cmd, options)
         r = Response(f, mimetype="image/jpeg", direct_passthrough=True)
         return r
@@ -222,7 +233,7 @@ def process(path, args, customer):
     exists = core.check_s3_object_exists(result_url)
     if args["with_info"] or args["force"] or not exists:
         clear_old_tmp_files()
-        im = fetch_image(original_url=original_url)
+        im = fetch_original(path, customer)
         f = core.resize(im.clone(), cmd, options)
         bucket_name = customer.write_bucket_name
         s3_config = core.S3ConnectionConfig(
@@ -447,6 +458,13 @@ class Customer(object):
         write_bucket_secret_key=None,
         write_bucket_region=None,
         write_bucket_endpoint_url=None,
+        read_bucket_private=False,
+        fallback_bucket_name=None,
+        fallback_bucket_key_id=None,
+        fallback_bucket_secret_key=None,
+        fallback_bucket_region=None,
+        fallback_bucket_endpoint_url=None,
+        fallback_bucket_private=False,
         **kwargs,
     ):
         self.read_bucket_name = read_bucket_name
@@ -461,6 +479,70 @@ class Customer(object):
         self.write_bucket_endpoint_url = (
             write_bucket_endpoint_url or read_bucket_endpoint_url
         )
+        self.read_bucket_private = read_bucket_private
+        # Optional second source of originals, tried when the read bucket does not have the
+        # file. Used while originals are migrated between buckets and only some are copied.
+        self.fallback_bucket_name = fallback_bucket_name
+        self.fallback_bucket_key_id = fallback_bucket_key_id
+        self.fallback_bucket_secret_key = fallback_bucket_secret_key
+        self.fallback_bucket_region = fallback_bucket_region
+        self.fallback_bucket_endpoint_url = fallback_bucket_endpoint_url
+        self.fallback_bucket_private = fallback_bucket_private
+
+    def origins(self) -> List["Origin"]:
+        """The buckets to read originals from, in the order they are tried."""
+        origins = [
+            Origin(
+                name="read",
+                bucket_name=self.read_bucket_name,
+                region=self.read_bucket_region,
+                endpoint_url=self.read_bucket_endpoint_url,
+                key_id=self.read_bucket_key_id,
+                secret_key=self.read_bucket_secret_key,
+                private=self.read_bucket_private,
+            )
+        ]
+        if self.fallback_bucket_name:
+            origins.append(
+                Origin(
+                    name="fallback",
+                    bucket_name=self.fallback_bucket_name,
+                    region=self.fallback_bucket_region,
+                    endpoint_url=self.fallback_bucket_endpoint_url,
+                    key_id=self.fallback_bucket_key_id,
+                    secret_key=self.fallback_bucket_secret_key,
+                    private=self.fallback_bucket_private,
+                )
+            )
+        return origins
+
+
+class Origin(object):
+    """A bucket that originals are read from.
+
+    Public buckets are read with a plain URL. Private buckets (``private: true`` in the
+    customer credentials) are read with a short-lived signed URL made from the bucket's keys.
+    """
+
+    def __init__(self, name, bucket_name, region, endpoint_url, key_id, secret_key, private):
+        self.name = name
+        self.bucket_name = bucket_name
+        self.region = region
+        self.endpoint_url = endpoint_url
+        self.key_id = key_id
+        self.secret_key = secret_key
+        self.private = private
+
+    def url(self, path):
+        if self.private:
+            s3_config = core.S3ConnectionConfig(
+                key_id=self.key_id,
+                secret_key=self.secret_key,
+                region=self.region,
+                endpoint_url=self.endpoint_url,
+            )
+            return core.get_signed_s3_url(self.bucket_name, path, s3_config)
+        return core.get_s3_url(self.bucket_name, self.region, path, endpoint=self.endpoint_url)
 
 
 class CredentialsStore(object):

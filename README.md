@@ -111,6 +111,36 @@ WARNING: This file must not be publicly accessible!
 
 Note: `write_bucket_*` parameters may be included to separate read and write buckets.
 
+#### Private read buckets and a fallback bucket
+Prism fetches originals with a plain GET, so by default the read bucket must allow public reads.
+Set `"read_bucket_private": true` to fetch originals with a short-lived signed URL made from the
+`read_bucket_key_id` and `read_bucket_secret_key` instead.
+
+A customer may also name a second bucket of originals with `fallback_bucket_name` (plus the
+optional `fallback_bucket_region`, `fallback_bucket_endpoint_url`, `fallback_bucket_key_id`,
+`fallback_bucket_secret_key` and `fallback_bucket_private`). This is meant for migrating originals
+from one bucket to another while only some have been copied: Prism reads from the read bucket
+first and tries the fallback only when the original is missing there, or is empty or not a valid
+image. Server errors and refused credentials are raised rather than falling back, so a broken
+read bucket stays visible. Each fetch logs which bucket served the original (at `INFO`; set
+`LOG_LEVEL=INFO` to see these lines).
+
+```
+{
+    "foo": {
+        "read_bucket_name": "foo-originals",
+        "read_bucket_endpoint_url": "https://ceph.example.org",
+        "read_bucket_region": "N/A",
+        "read_bucket_key_id": "...",
+        "read_bucket_secret_key": "...",
+        "read_bucket_private": true,
+        "write_bucket_name": "foo-thumbnails",
+        "fallback_bucket_name": "foo-originals-old",
+        "fallback_bucket_region": "us-east-1"
+    }
+}
+```
+
 ### TEST_IMAGE
 The TEST_IMAGE setting is used to provide an image to be used for the test and health check endpoints. In multi customer mode the DEFAULT_CUSTOMER setting must also be set for the test endpoints to work.
 
