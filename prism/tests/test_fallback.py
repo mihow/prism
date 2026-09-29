@@ -1,10 +1,11 @@
-"""Tests for reading originals from a fallback origin.
+"""Tests for reading originals from a fallback origin and copying them back to the read bucket.
 
 HTTP is stubbed: origins._session is replaced with FakeHttp, which answers per origin and
 records every request, so these tests run without S3, minio or the network. The two tests in
 TestRealHttp use a local HTTP server and a closed local port instead, to exercise the real
 retry adapter and timeouts.
 """
+import base64
 import hashlib
 import http.server
 import logging
@@ -33,6 +34,7 @@ from prism.app import (  # noqa: E402
     CustomerConfigError,
     SingleCustomerCredentialsStore,
     fetch_original,
+    process,
 )
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -162,6 +164,10 @@ class OriginTestCase(unittest.TestCase):
         origins._sentry_last_sent.clear()
         patcher = mock.patch.object(origins.sentry_sdk, "capture_exception")
         self.sentry = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.queue = origins.WriteBackQueue(workers=1, max_items=8, max_pending_bytes=10 * 1024 * 1024, autostart=False)
+        patcher = mock.patch.object(origins, "default_write_back_queue", return_value=self.queue)
+        patcher.start()
         self.addCleanup(patcher.stop)
 
     def use_http(self, routes) -> FakeHttp:
@@ -377,6 +383,249 @@ class TestCdnFallback(OriginTestCase):
 
 
 # ---------------------------------------------------------------------------------------------
+# Write-back
+# ---------------------------------------------------------------------------------------------
+
+
+class TestWriteBack(OriginTestCase):
+    def wb_customer(self, **overrides):
+        return make_customer(fallback_write_back=True, **overrides)
+
+    def run_write_back(self, routes, customer=None):
+        self.use_http(routes)
+        im = fetch_original(PATH, customer or self.wb_customer())
+        with self.assertLogs("prism.origins", level="INFO") as logs:
+            self.queue.run_pending()
+        self.logs = logs.output
+        return im
+
+    def puts(self):
+        return [c for c in self.http.calls if c.method == "PUT"]
+
+    def test_queued_job_holds_the_bytes_but_not_the_decoded_image(self):
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image()})
+        fetch_original(PATH, self.wb_customer())
+        job = self.queue._queue.get_nowait()
+        self.assertEqual(job.data, JPEG)
+        self.assertFalse(any(hasattr(value, "width") for value in vars(job).values()))
+
+    def test_disabled_by_default(self):
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image()})
+        fetch_original(PATH, make_customer())
+        self.assertEqual(self.queue._queue.qsize(), 0)
+
+    def test_written_when_primary_is_missing(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(content_type="image/pjpeg"),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): response(200, b"", {"ETag": f'"{md5_hex(JPEG)}"'}),
+        })
+        put, = self.puts()
+        self.assertEqual(put.kwargs["data"], JPEG)
+        self.assertEqual(put.kwargs["headers"]["Content-Type"], "image/pjpeg")
+        self.assertEqual(put.kwargs["headers"]["Content-MD5"], base64.b64encode(hashlib.md5(JPEG).digest()).decode())
+        parsed = urllib.parse.urlparse(put.url)
+        self.assertEqual((parsed.hostname, parsed.path), ("ceph.example.org", "/primary/" + PATH))
+        self.assertIn("Signature", urllib.parse.parse_qs(parsed.query))
+        self.assertTrue(any("write-back written" in line for line in self.logs), self.logs)
+        self.assertEqual(origins.STATS.snapshot()["write_back.written"], 1)
+
+    def test_existing_valid_copy_is_not_overwritten(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=md5_hex(JPEG), length=len(JPEG)),
+        })
+        self.assertEqual(self.puts(), [])
+        self.assertTrue(any("write-back exists" in line for line in self.logs))
+
+    def test_copy_that_appeared_after_a_miss_is_left_alone(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=md5_hex(OTHER_JPEG), length=len(OTHER_JPEG)),
+        })
+        self.assertEqual(self.puts(), [])
+        self.assertEqual(origins.STATS.snapshot()["write_back.exists"], 1)
+
+    def test_empty_primary_copy_is_replaced(self):
+        empty_etag = md5_hex(b"")
+        self.run_write_back({
+            ("GET", "read"): image(b""),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=empty_etag, length=0),
+            ("PUT", "read"): response(200, b"", {"ETag": f'"{md5_hex(JPEG)}"'}),
+        })
+        put, = self.puts()
+        self.assertEqual(put.kwargs["data"], JPEG)
+        self.assertTrue(any("write-back replaced-broken" in line for line in self.logs), self.logs)
+
+    def test_undecodable_primary_copy_is_replaced(self):
+        self.run_write_back({
+            ("GET", "read"): image(b"garbage"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=md5_hex(b"garbage"), length=7),
+            ("PUT", "read"): response(200),
+        })
+        self.assertEqual(len(self.puts()), 1)
+        self.assertEqual(origins.STATS.snapshot()["write_back.replaced-broken"], 1)
+
+    def test_broken_copy_that_changed_since_the_read_is_left_alone(self):
+        self.run_write_back({
+            ("GET", "read"): image(b"garbage"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=md5_hex(OTHER_JPEG), length=len(OTHER_JPEG)),
+        })
+        self.assertEqual(self.puts(), [])
+
+    def test_undecodable_fallback_is_never_written(self):
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image(b"junk")})
+        with self.assertRaises(BadRequest):
+            fetch_original(PATH, self.wb_customer())
+        self.assertEqual(self.queue._queue.qsize(), 0)
+
+    def test_fallback_bytes_not_matching_their_etag_are_skipped(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(etag=md5_hex(OTHER_JPEG)),
+        })
+        self.assertEqual(self.puts(), [])
+        self.assertTrue(any("write-back skipped" in line and "ETag" in line for line in self.logs), self.logs)
+
+    def test_fallback_without_content_length_is_skipped(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(content_length=False),
+        })
+        self.assertEqual(self.puts(), [])
+        self.assertEqual(origins.STATS.snapshot()["write_back.skipped"], 1)
+
+    def test_multipart_etag_is_not_compared(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(etag="0123456789abcdef0123456789abcdef-2"),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): response(200),
+        })
+        self.assertEqual(len(self.puts()), 1)
+
+    def test_not_attempted_when_primary_was_unavailable(self):
+        self.use_http({("GET", "read"): requests.ConnectionError("down"), ("GET", "fallback"): image()})
+        with self.assertLogs("prism.origins", level="INFO"):
+            fetch_original(PATH, self.wb_customer())
+        self.assertEqual(self.queue._queue.qsize(), 0)
+        self.assertEqual(origins.STATS.snapshot()["write_back.skipped"], 1)
+
+    def test_not_attempted_when_primary_served(self):
+        self.use_http({("GET", "read"): image()})
+        fetch_original(PATH, self.wb_customer())
+        self.assertEqual(self.queue._queue.qsize(), 0)
+
+    def test_failed_put_is_logged_and_counted(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): s3_error(500, "InternalError"),
+        })
+        self.assertTrue(any("WARNING" in line and "write-back failed" in line and "PUT 500" in line for line in self.logs), self.logs)
+        self.assertEqual(origins.STATS.snapshot()["write_back.failed"], 1)
+
+    def test_put_connection_error_is_a_failure_without_signature_in_the_log(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): requests.ConnectionError("Max retries exceeded with url: /primary/x.jpg?Signature=abc%3D&Expires=1&AWSAccessKeyId=key"),
+        })
+        line, = [line for line in self.logs if "write-back failed" in line]
+        self.assertIn("Signature=[redacted]", line)
+        self.assertNotIn("abc%3D", line)
+
+    def test_only_original_bytes_are_written_never_the_resized_output(self):
+        self.use_http({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): response(200),
+        })
+        args = {
+            "command": "resize",
+            "options": {"w": 100, "h": 100, "q": 80, "out_format": "jpg", "premultiplied_alpha": None, "filters": None},
+            "debug": True,
+        }
+        resized = process(PATH, args, self.wb_customer()).response.getvalue()
+        self.assertNotEqual(resized, JPEG)
+        with self.assertLogs("prism.origins", level="INFO"):
+            self.queue.run_pending()
+        put, = self.puts()
+        self.assertEqual(put.kwargs["data"], JPEG)
+
+    def test_full_queue_drops_and_logs(self):
+        self.queue = origins.WriteBackQueue(workers=1, max_items=1, max_pending_bytes=10 * 1024 * 1024, autostart=False)
+        self.use_http({
+            ("GET", "read"): [s3_error(404, "NoSuchKey"), s3_error(404, "NoSuchKey")],
+            ("GET", "fallback"): [image(), image()],
+        })
+        target = self.wb_customer().write_back_target()
+        with self.assertLogs("prism.origins", level="WARNING") as logs:
+            origins.read_original("a.jpg", self.wb_customer().origins(), write_back=target, write_back_queue=self.queue)
+            im = origins.read_original("b.jpg", self.wb_customer().origins(), write_back=target, write_back_queue=self.queue)
+        self.assertEqual(im.image.width, 500)
+        self.assertTrue(any("write-back dropped" in line and "queue full" in line for line in logs.output))
+        self.assertEqual(origins.STATS.snapshot()["write_back.dropped"], 1)
+
+    def test_pending_bytes_limit_drops(self):
+        queue = origins.WriteBackQueue(workers=1, max_items=10, max_pending_bytes=len(JPEG) + 10, autostart=False)
+        target = self.wb_customer().write_back_target()
+        self.assertTrue(queue.submit(origins.WriteBackJob(target, "a.jpg", JPEG, content_length=len(JPEG))))
+        with self.assertLogs("prism.origins", level="WARNING"):
+            self.assertFalse(queue.submit(origins.WriteBackJob(target, "b.jpg", JPEG, content_length=len(JPEG))))
+
+    def test_a_key_already_queued_is_not_queued_twice(self):
+        target = self.wb_customer().write_back_target()
+        self.assertTrue(self.queue.submit(origins.WriteBackJob(target, PATH, JPEG, content_length=len(JPEG))))
+        self.assertFalse(self.queue.submit(origins.WriteBackJob(target, PATH, JPEG, content_length=len(JPEG))))
+        self.assertEqual(self.queue._queue.qsize(), 1)
+
+    def test_queueing_error_does_not_affect_the_response(self):
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image()})
+        with mock.patch.object(self.queue, "submit", side_effect=RuntimeError("boom")):
+            with self.assertLogs("prism.origins", level="ERROR"):
+                im = fetch_original(PATH, self.wb_customer())
+        self.assertEqual(im.width, 500)
+
+    def test_background_failure_does_not_affect_the_response(self):
+        """With real worker threads, a PUT that fails leaves the served image untouched."""
+        self.queue = origins.WriteBackQueue(workers=1, max_items=8, max_pending_bytes=10 * 1024 * 1024)
+        self.use_http({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): requests.ConnectionError("down"),
+        })
+        with self.assertLogs("prism.origins", level="INFO"):
+            im = origins.read_original(
+                PATH, self.wb_customer().origins(), write_back=self.wb_customer().write_back_target(),
+                write_back_queue=self.queue,
+            )
+            self.queue.join()
+        self.assertEqual(im.image.width, 500)
+        self.assertEqual(im.data, JPEG)
+        self.assertEqual(origins.STATS.snapshot()["write_back.failed"], 1)
+
+    def test_put_signature_covers_content_type_and_md5(self):
+        target = self.wb_customer().write_back_target()
+        with mock.patch("boto.s3.connection.time.time", return_value=1_700_000_000):
+            a = target.url(PATH, method="PUT", headers={"Content-Type": "image/jpeg", "Content-MD5": "a"})
+            b = target.url(PATH, method="PUT", headers={"Content-Type": "image/png", "Content-MD5": "a"})
+            c = target.url(PATH, method="PUT", headers={"Content-Type": "image/jpeg", "Content-MD5": "b"})
+        signature = lambda url: urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["Signature"][0]  # noqa: E731
+        self.assertEqual(len({signature(a), signature(b), signature(c)}), 3)
+
+
+# ---------------------------------------------------------------------------------------------
 # GIF passthrough
 # ---------------------------------------------------------------------------------------------
 
@@ -465,6 +714,8 @@ class TestBackwardCompatibility(OriginTestCase):
         customer = legacy_customer()
         self.assertFalse(customer.read_bucket_private)
         self.assertFalse(customer.fallback_bucket_private)
+        self.assertFalse(customer.fallback_write_back)
+        self.assertIsNone(customer.write_back_target())
         only, = customer.origins()
         self.assertEqual(only.name, "read")
         self.assertFalse(only.private)
@@ -515,6 +766,16 @@ class TestCustomerConfig(unittest.TestCase):
         self.assertIs(Customer(read_bucket_name="b", read_bucket_private=0).read_bucket_private, False)
         with self.assertRaises(CustomerConfigError):
             Customer(read_bucket_name="b", read_bucket_private="maybe")
+
+    def test_write_back_requires_a_fallback_and_read_keys(self):
+        with self.assertRaises(CustomerConfigError):
+            Customer(read_bucket_name="b", read_bucket_key_id="k", read_bucket_secret_key="s", fallback_write_back=True)
+        with self.assertRaises(CustomerConfigError):
+            Customer(read_bucket_name="b", fallback_cdn_url=CDN, fallback_write_back=True)
+        customer = Customer(read_bucket_name="b", read_bucket_key_id="k", read_bucket_secret_key="s",
+                            fallback_cdn_url=CDN, fallback_write_back="true")
+        target = customer.write_back_target()
+        self.assertEqual((target.bucket_name, target.private), ("b", True))
 
     def test_invalid_config_answers_500_and_is_reported(self):
         app = App(credentials_store=SingleCustomerCredentialsStore({"read_bucket_name": "b", "read_bucket_private": True}))

@@ -204,7 +204,7 @@ def fetch_original(path, customer):
     origin could not be read.
     """
     try:
-        original = prism_origins.read_original(path, customer.origins())
+        original = prism_origins.read_original(path, customer.origins(), write_back=customer.write_back_target())
     except prism_origins.ReadFailed as e:
         raise _http_exception(e)
     return original.image
@@ -502,6 +502,7 @@ class Customer(object):
         fallback_bucket_endpoint_url=None,
         fallback_bucket_private=False,
         fallback_cdn_url=None,
+        fallback_write_back=False,
         **kwargs,
     ):
         self.read_bucket_name = read_bucket_name
@@ -528,6 +529,8 @@ class Customer(object):
         self.fallback_bucket_endpoint_url = fallback_bucket_endpoint_url
         self.fallback_bucket_private = _as_bool(fallback_bucket_private, "fallback_bucket_private")
         self.fallback_cdn_url = fallback_cdn_url
+        # Copy originals served by the fallback into the read bucket, in the background.
+        self.fallback_write_back = _as_bool(fallback_write_back, "fallback_write_back")
         self._validate()
 
     def _validate(self):
@@ -541,6 +544,11 @@ class Customer(object):
             raise CustomerConfigError("set either fallback_bucket_name or fallback_cdn_url, not both")
         if self.fallback_cdn_url and not str(self.fallback_cdn_url).startswith(("https://", "http://")):
             raise CustomerConfigError("fallback_cdn_url must be an http(s) URL")
+        if self.fallback_write_back:
+            if not (self.fallback_bucket_name or self.fallback_cdn_url):
+                raise CustomerConfigError("fallback_write_back requires a fallback origin")
+            if not (self.read_bucket_key_id and self.read_bucket_secret_key):
+                raise CustomerConfigError("fallback_write_back requires read_bucket_key_id and read_bucket_secret_key")
 
     def origins(self) -> List[object]:
         """The origins to read originals from, in the order they are tried."""
@@ -570,6 +578,18 @@ class Customer(object):
         elif self.fallback_cdn_url:
             result.append(prism_origins.HttpOrigin(name="fallback", base_url=self.fallback_cdn_url))
         return result
+
+    def write_back_target(self) -> Optional[prism_origins.WriteBackTarget]:
+        """Where originals served by the fallback are copied to, or None when write-back is off."""
+        if not self.fallback_write_back:
+            return None
+        return prism_origins.WriteBackTarget(
+            bucket_name=self.read_bucket_name,
+            region=self.read_bucket_region,
+            endpoint_url=self.read_bucket_endpoint_url,
+            key_id=self.read_bucket_key_id,
+            secret_key=self.read_bucket_secret_key,
+        )
 
 
 # Kept for code that imported the origin class from here.

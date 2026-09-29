@@ -22,3 +22,7 @@ ORIGIN_RETRIES = int(os.environ.get('ORIGIN_RETRIES', '1'))
 ORIGINS_LOG_LEVEL = os.environ.get('ORIGINS_LOG_LEVEL')
 # How often each worker process logs its origin and write-back counters, in seconds.
 ORIGIN_STATS_INTERVAL = float(os.environ.get('ORIGIN_STATS_INTERVAL', '300'))
+# Background copying of originals from the fallback origin back to the read bucket.
+WRITE_BACK_WORKERS = int(os.environ.get('WRITE_BACK_WORKERS', '2'))
+WRITE_BACK_QUEUE_SIZE = int(os.environ.get('WRITE_BACK_QUEUE_SIZE', '64'))
+WRITE_BACK_MAX_PENDING_MB = int(os.environ.get('WRITE_BACK_MAX_PENDING_MB', '256'))

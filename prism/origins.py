@@ -18,12 +18,20 @@ Decoding catches empty and unreadable files but not every damaged one: ImageMagi
 JPEG that is cut short (the missing rows come out grey), so a truncated copy on the read
 bucket is served as it is. Nothing here verifies checksums on the read path.
 
+When ``fallback_write_back`` is enabled for a customer, an original that was served by the
+fallback is copied, byte for byte, into the read bucket under the same key by a small pool of
+background threads, so the next request for it is served without another fallback read. See
+``WriteBackQueue``.
+
 All origin logging goes to the ``prism.origins`` logger, which can be enabled on its own with
 the ``ORIGINS_LOG_LEVEL`` setting.
 """
+import base64
 import collections
+import hashlib
 import logging
 import os
+import queue
 import re
 import threading
 import time
@@ -233,9 +241,9 @@ class S3Origin:
             endpoint_url=self.endpoint_url,
         )
 
-    def url(self, path: str, method: str = "GET") -> str:
+    def url(self, path: str, method: str = "GET", headers: Optional[Dict[str, str]] = None) -> str:
         if self.private:
-            return core.get_signed_s3_url(self.bucket_name, path, self.s3_config(), method=method)
+            return core.get_signed_s3_url(self.bucket_name, path, self.s3_config(), method=method, headers=headers)
         return core.get_s3_url(self.bucket_name, self.region, path, endpoint=self.endpoint_url)
 
     def describe(self) -> str:
@@ -489,9 +497,36 @@ def _try_origins(origins: List[Any], path: str, attempt: Callable[[Any, str], An
     raise ReadFailed(404, "Not found.")
 
 
-def read_original(path: str, origins: List[Any]) -> Original:
-    """Read an original from the first origin that has a usable copy."""
-    _, original, _ = _try_origins(origins, path, fetch)
+def read_original(path: str, origins: List[Any], write_back: Optional["WriteBackTarget"] = None,
+                  write_back_queue: Optional["WriteBackQueue"] = None) -> Original:
+    """Read an original from the first origin that has a usable copy.
+
+    When ``write_back`` is given and the original came from a later origin while the first
+    origin reported it missing or broken, the bytes are queued for copying to the first origin.
+    Queueing never raises and never delays the response.
+    """
+    origin, original, failures = _try_origins(origins, path, fetch)
+    if write_back is not None and origin is not origins[0] and failures:
+        primary_failure = failures[0]
+        if isinstance(primary_failure, (OriginMissing, OriginBroken)):
+            try:
+                (write_back_queue or default_write_back_queue()).submit(
+                    WriteBackJob(
+                        target=write_back,
+                        key=path,
+                        data=original.data,
+                        content_type=original.content_type,
+                        etag=original.etag,
+                        content_length=original.content_length,
+                        replace_broken=isinstance(primary_failure, OriginBroken),
+                        broken_etag=primary_failure.etag,
+                    )
+                )
+            except Exception:
+                logger.exception("write-back could not be queued: path=%s", path)
+        else:
+            logger.info("write-back skipped: reason=%s origin is %s path=%s", primary_failure.origin.name, primary_failure.kind, path)
+            STATS.incr("write_back.skipped")
     return original
 
 
@@ -503,3 +538,205 @@ def locate_original(path: str, origins: List[Any]):
     """
     origin, _, _ = _try_origins(origins, path, probe)
     return origin
+
+
+# ---------------------------------------------------------------------------------------------
+# Write-back
+# ---------------------------------------------------------------------------------------------
+
+
+class WriteBackTarget(S3Origin):
+    """The read bucket, addressed with its credentials so originals can be copied into it.
+
+    Requests are always signed (SigV2 query signatures with path-style URLs on a custom
+    endpoint, as for private reads), whether or not the bucket allows public reads.
+    """
+
+    def __init__(self, bucket_name, region, endpoint_url, key_id, secret_key):
+        super().__init__("read", bucket_name, region, endpoint_url, key_id, secret_key, private=True)
+
+
+@dataclass
+class WriteBackJob:
+    """One original to copy into the read bucket.
+
+    It holds the fallback's bytes and response headers but not the decoded image, which can be
+    tens of times larger and is not needed once the request has been answered.
+    """
+
+    target: WriteBackTarget
+    key: str
+    data: bytes
+    content_type: Optional[str] = None
+    # ETag and Content-Length of the fallback response, to check the bytes before copying them.
+    etag: Optional[str] = None
+    content_length: Optional[int] = None
+    # True when the read bucket had an empty or undecodable copy that should be replaced.
+    replace_broken: bool = False
+    # ETag of that broken copy, so a copy that changed since it was read is left alone.
+    broken_etag: Optional[str] = None
+
+
+_MD5_ETAG_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
+def _strip_etag(etag: Optional[str]) -> str:
+    return (etag or "").strip().strip('"').lower()
+
+
+def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
+    """Copy one original into the read bucket. Returns ``(outcome, detail)``.
+
+    Outcomes: ``written`` (the key was missing), ``replaced-broken`` (a broken copy was
+    overwritten), ``exists`` (a copy is already there and was left alone), ``skipped`` (the
+    fallback bytes could not be verified, so nothing was written) and ``failed``.
+    """
+    data = job.data
+    if not data:
+        return "skipped", "empty"
+    if job.content_length is None:
+        return "skipped", "fallback response had no Content-Length"
+    if job.content_length != len(data):
+        return "skipped", f"length mismatch: {len(data)} of {job.content_length} bytes"
+    digest = hashlib.md5(data)
+    md5_hex = digest.hexdigest()
+    fallback_etag = _strip_etag(job.etag)
+    # A single-part S3 upload's ETag is the MD5 of its bytes; check it when it has that form.
+    if _MD5_ETAG_RE.match(fallback_etag) and fallback_etag != md5_hex:
+        return "skipped", "fallback ETag does not match the bytes received"
+
+    target = job.target
+    head = _request(target, "HEAD", target.url(job.key, method="HEAD"))
+    if head.status_code == 200:
+        existing_etag = _strip_etag(head.headers.get("ETag"))
+        if existing_etag == md5_hex:
+            return "exists", "identical copy already present"
+        if not job.replace_broken:
+            return "exists", "a copy appeared since the read; left alone"
+        if job.broken_etag and existing_etag != _strip_etag(job.broken_etag):
+            return "exists", "the broken copy changed since the read; left alone"
+        outcome = "replaced-broken"
+    elif head.status_code == 404:
+        outcome = "written"
+    else:
+        return "failed", f"HEAD {classify_status(target, head.status_code, None).reason}"
+
+    headers = {
+        "Content-Type": job.content_type or "application/octet-stream",
+        "Content-MD5": base64.b64encode(digest.digest()).decode("ascii"),
+    }
+    put = _request(target, "PUT", target.url(job.key, method="PUT", headers=headers), data=data, headers=headers)
+    if put.status_code >= 300:
+        return "failed", f"PUT {put.status_code} {s3_error_code(put) or ''}".strip()
+    stored_etag = _strip_etag(put.headers.get("ETag"))
+    if stored_etag and _MD5_ETAG_RE.match(stored_etag) and stored_etag != md5_hex:
+        return "failed", "stored ETag does not match the bytes sent"
+    return outcome, f"{len(data)} bytes"
+
+
+class WriteBackQueue:
+    """A bounded queue and a few background threads that run write_back_one.
+
+    ``submit`` never blocks: when the queue is full, or the bytes waiting would exceed
+    ``max_pending_bytes``, the job is dropped and logged; the next request for that original
+    reads the fallback again and queues it again. A key that is already waiting is not queued
+    twice. Threads start on first use in each process (uWSGI forks workers after import).
+    Jobs still waiting when a worker process exits are lost, which only costs a later re-read.
+    """
+
+    def __init__(self, workers: int, max_items: int, max_pending_bytes: int,
+                 stats: Optional[OriginStats] = None, autostart: bool = True):
+        self.workers = workers
+        self.max_items = max_items
+        self.max_pending_bytes = max_pending_bytes
+        self.stats = stats or STATS
+        self.autostart = autostart
+        self._lock = threading.Lock()
+        self._pid: Optional[int] = None
+        self._queue: "queue.Queue[WriteBackJob]" = queue.Queue(maxsize=max_items)
+        self._pending_keys: set = set()
+        self._pending_bytes = 0
+
+    def _ensure_started(self) -> None:
+        if self._pid == os.getpid():
+            return
+        self._queue = queue.Queue(maxsize=self.max_items)
+        self._pending_keys = set()
+        self._pending_bytes = 0
+        self._pid = os.getpid()
+        if self.autostart:
+            for i in range(self.workers):
+                threading.Thread(target=self._run, name=f"prism-write-back-{i}", daemon=True).start()
+
+    def submit(self, job: WriteBackJob) -> bool:
+        size = len(job.data)
+        with self._lock:
+            self._ensure_started()
+            if job.key in self._pending_keys:
+                self.stats.incr("write_back.already_queued")
+                return False
+            if self._pending_bytes + size > self.max_pending_bytes:
+                reason = "pending bytes limit"
+            else:
+                try:
+                    self._queue.put_nowait(job)
+                except queue.Full:
+                    reason = "queue full"
+                else:
+                    self._pending_keys.add(job.key)
+                    self._pending_bytes += size
+                    self.stats.incr("write_back.queued")
+                    return True
+        logger.warning("write-back dropped: reason=%s path=%s", reason, job.key)
+        self.stats.incr("write_back.dropped")
+        return False
+
+    def run_pending(self) -> None:
+        """Process every waiting job on the calling thread. For tests and autostart=False."""
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            self._process(job)
+
+    def _run(self) -> None:
+        while True:
+            job = self._queue.get()
+            self._process(job)
+
+    def _process(self, job: WriteBackJob) -> None:
+        try:
+            outcome, detail = write_back_one(job)
+        except OriginUnavailable as e:
+            outcome, detail = "failed", e.reason
+        except Exception as e:
+            outcome, detail = "failed", scrub(f"{type(e).__name__}: {e}")
+            _capture(e, "write_back:error")
+        finally:
+            with self._lock:
+                self._pending_keys.discard(job.key)
+                self._pending_bytes -= len(job.data)
+            self._queue.task_done()
+        level = logging.WARNING if outcome == "failed" else logging.INFO
+        logger.log(level, "write-back %s: %s bucket=%s path=%s", outcome, detail, job.target.bucket_name, job.key)
+        self.stats.incr(f"write_back.{outcome}")
+
+    def join(self) -> None:
+        self._queue.join()
+
+
+_default_queue: Optional[WriteBackQueue] = None
+_default_queue_lock = threading.Lock()
+
+
+def default_write_back_queue() -> WriteBackQueue:
+    global _default_queue
+    with _default_queue_lock:
+        if _default_queue is None:
+            _default_queue = WriteBackQueue(
+                workers=settings.WRITE_BACK_WORKERS,
+                max_items=settings.WRITE_BACK_QUEUE_SIZE,
+                max_pending_bytes=settings.WRITE_BACK_MAX_PENDING_MB * 1024 * 1024,
+            )
+        return _default_queue
