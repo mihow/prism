@@ -4,15 +4,25 @@ FROM python:3.11-bookworm
 RUN apt-get update
 RUN apt-get install webp -y
 
-# This specific version of ImageMagick is required for compatibility with Wand
-# Fetched from the GitHub release tag; the imagemagick.org download hosts have moved and refuse connections at times.
-RUN wget -O ImageMagick-6.9.10-90.tar.gz https://github.com/ImageMagick/ImageMagick6/archive/refs/tags/6.9.10-90.tar.gz && \
-tar -xzf ImageMagick-6.9.10-90.tar.gz && \
-cd ImageMagick6-6.9.10-90 && \
-./configure --with-webp=yes && \
-make -j"$(nproc)" && \
-make install && \
-ldconfig /usr/local/lib
+# This specific version of ImageMagick is required for compatibility with Wand.
+# It is fetched from the GitHub release tag (the imagemagick.org download hosts have moved and
+# refuse connections at times) and checked against a pinned SHA-256, so a changed or tampered
+# archive fails the build instead of being compiled. The source tree is removed in the same layer
+# so it does not add ~100 MB to the image.
+ARG IMAGEMAGICK_VERSION=6.9.10-90
+ARG IMAGEMAGICK_SHA256=b7b2335b05e75c80c1f472c8662c49375904e378ca79d098909078d8a43f04b7
+RUN wget -q -O /tmp/imagemagick.tar.gz \
+        "https://github.com/ImageMagick/ImageMagick6/archive/refs/tags/${IMAGEMAGICK_VERSION}.tar.gz" && \
+    echo "${IMAGEMAGICK_SHA256}  /tmp/imagemagick.tar.gz" | sha256sum -c - && \
+    mkdir /tmp/imagemagick && \
+    tar -xzf /tmp/imagemagick.tar.gz -C /tmp/imagemagick --strip-components=1 && \
+    cd /tmp/imagemagick && \
+    ./configure --with-webp=yes && \
+    make -j"$(nproc)" && \
+    make install && \
+    cd / && \
+    rm -rf /tmp/imagemagick /tmp/imagemagick.tar.gz && \
+    ldconfig /usr/local/lib
 
 RUN pip install uwsgi uwsgitop
 
@@ -31,4 +41,4 @@ EXPOSE 3001
 ENV UWSGI_PROCESSES=2
 ENV UWSGI_THREADS=2
 
-CMD ["uwsgi", "prism.uwsgi.ini"] 
+CMD ["uwsgi", "prism.uwsgi.ini"]

@@ -2,3 +2,6 @@
 .env*
 credentials.json
 credentials*.json
+.venv
+.git
+__pycache__
