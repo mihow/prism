@@ -335,6 +335,48 @@ class TestRetryBudget(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
+# CDN fallback
+# ---------------------------------------------------------------------------------------------
+
+
+class TestCdnFallback(OriginTestCase):
+    def cdn_customer(self, **overrides):
+        return make_customer(fallback_bucket_name=None, fallback_bucket_region=None, fallback_cdn_url=CDN + "/", **overrides)
+
+    def test_cdn_url_is_the_base_url_plus_the_key(self):
+        cdn = self.cdn_customer().origins()[1]
+        self.assertIsInstance(cdn, origins.HttpOrigin)
+        self.assertEqual(cdn.url(PATH), f"{CDN}/{PATH}")
+        self.assertEqual(cdn.url("/" + PATH, method="HEAD"), f"{CDN}/{PATH}")
+        self.assertFalse(cdn.private)
+
+    def test_cdn_url_percent_encodes_the_key(self):
+        cdn = origins.HttpOrigin("fallback", CDN)
+        self.assertEqual(cdn.url("photos/a b+c/d.jpg"), f"{CDN}/photos/a%20b%2Bc/d.jpg")
+
+    def test_primary_miss_is_served_by_the_cdn_without_a_signature(self):
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "cdn"): image()})
+        im = fetch_original(PATH, self.cdn_customer())
+        self.assertEqual(im.width, 500)
+        cdn_call = self.http.calls[1]
+        self.assertEqual(cdn_call.url, f"{CDN}/{PATH}")
+        self.assertNotIn("Signature", cdn_call.url)
+
+    def test_cdn_403_is_a_miss(self):
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "cdn"): s3_error(403, "AccessDenied")})
+        with self.assertRaises(NotFound):
+            fetch_original(PATH, self.cdn_customer())
+
+    def test_bucket_and_cdn_fallback_together_are_rejected(self):
+        with self.assertRaises(CustomerConfigError):
+            make_customer(fallback_cdn_url=CDN)
+
+    def test_cdn_url_must_be_http(self):
+        with self.assertRaises(CustomerConfigError):
+            self.cdn_customer().__class__(read_bucket_name="primary", fallback_cdn_url="cdn.example.net")
+
+
+# ---------------------------------------------------------------------------------------------
 # GIF passthrough
 # ---------------------------------------------------------------------------------------------
 
@@ -404,6 +446,11 @@ class TestGifPassthrough(OriginTestCase):
         self.use_http({("HEAD", "read"): head(404), ("HEAD", "fallback"): head(403)})
         resp = self.app().dispatch_request(gif_request(self.GIF))
         self.assertEqual(status_of(resp), 404)
+
+    def test_cdn_fallback_redirects_to_the_cdn(self):
+        self.use_http({("HEAD", "read"): head(404), ("HEAD", "cdn"): head(200, length=10)})
+        resp = self.app(fallback_bucket_name=None, fallback_cdn_url=CDN).dispatch_request(gif_request(self.GIF))
+        self.assertEqual(resp.headers["Location"], f"{CDN}/{self.GIF}")
 
 
 # ---------------------------------------------------------------------------------------------
@@ -565,7 +612,7 @@ class TestStats(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------------------------
-# Real HTTP: retry budget against a closed port, fallback served by a local server
+# Real HTTP: retry budget against a closed port, CDN fallback served by a local server
 # ---------------------------------------------------------------------------------------------
 
 
@@ -613,15 +660,14 @@ class TestRealHttp(unittest.TestCase):
             read_bucket_key_id="key",
             read_bucket_secret_key="secret",
             read_bucket_private=True,
-            fallback_bucket_name="fallback",
-            fallback_bucket_endpoint_url=self.cdn,
+            fallback_cdn_url=self.cdn,
         )
         started = time.monotonic()
         with self.assertLogs("prism.origins", level="WARNING") as logs:
             im = fetch_original(PATH, customer)
         self.assertLess(time.monotonic() - started, 3.0)
         self.assertEqual(im.width, 500)
-        self.assertEqual(_ImageHandler.requests_seen, ["/fallback/" + PATH])
+        self.assertEqual(_ImageHandler.requests_seen, ["/" + PATH])
         warning, = [line for line in logs.output if "unavailable" in line]
         self.assertIn("ConnectionError", warning)
         self.assertNotIn("Signature=", warning.replace("Signature=[redacted]", ""))

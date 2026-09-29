@@ -1,7 +1,7 @@
 """Read original images from an ordered list of origins, and copy fallback reads back.
 
 A customer normally has one origin: its read bucket. During a storage migration it can also
-have a fallback origin (a second bucket) that holds the
+have a fallback origin (a second bucket, or an HTTPS CDN in front of one) that holds the
 originals which have not been copied to the read bucket yet. This module decides, for each
 original, which origin serves it:
 
@@ -27,6 +27,7 @@ import os
 import re
 import threading
 import time
+import urllib.parse
 from dataclasses import dataclass
 from io import BytesIO
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -242,6 +243,30 @@ class S3Origin:
 
     def __repr__(self) -> str:
         return f"S3Origin(name={self.name!r}, bucket_name={self.bucket_name!r}, private={self.private!r})"
+
+
+class HttpOrigin:
+    """An origin read with an anonymous GET of ``<base_url>/<key>``.
+
+    Meant for a CDN such as a CloudFront distribution in front of the old bucket, which is cheaper
+    to read from than the bucket itself. The key is percent-encoded, keeping ``/``.
+    """
+
+    private = False
+
+    def __init__(self, name: str, base_url: str):
+        self.name = name
+        self.base_url = base_url.rstrip("/")
+        self.bucket_name = None
+
+    def url(self, path: str, method: str = "GET") -> str:
+        return f"{self.base_url}/{urllib.parse.quote(path.lstrip('/'), safe='/')}"
+
+    def describe(self) -> str:
+        return f"{self.name} url={self.base_url}"
+
+    def __repr__(self) -> str:
+        return f"HttpOrigin(name={self.name!r}, base_url={self.base_url!r})"
 
 
 # ---------------------------------------------------------------------------------------------

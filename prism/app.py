@@ -501,6 +501,7 @@ class Customer(object):
         fallback_bucket_region=None,
         fallback_bucket_endpoint_url=None,
         fallback_bucket_private=False,
+        fallback_cdn_url=None,
         **kwargs,
     ):
         self.read_bucket_name = read_bucket_name
@@ -518,12 +519,15 @@ class Customer(object):
         self.read_bucket_private = _as_bool(read_bucket_private, "read_bucket_private")
         # Optional second source of originals, tried when the read bucket does not have the
         # file. Used while originals are migrated between buckets and only some are copied.
+        # It is either a bucket (fallback_bucket_*) or an HTTPS base URL such as a CDN in
+        # front of the old bucket (fallback_cdn_url), not both.
         self.fallback_bucket_name = fallback_bucket_name
         self.fallback_bucket_key_id = fallback_bucket_key_id
         self.fallback_bucket_secret_key = fallback_bucket_secret_key
         self.fallback_bucket_region = fallback_bucket_region
         self.fallback_bucket_endpoint_url = fallback_bucket_endpoint_url
         self.fallback_bucket_private = _as_bool(fallback_bucket_private, "fallback_bucket_private")
+        self.fallback_cdn_url = fallback_cdn_url
         self._validate()
 
     def _validate(self):
@@ -533,6 +537,10 @@ class Customer(object):
             raise CustomerConfigError(
                 "fallback_bucket_private requires fallback_bucket_key_id and fallback_bucket_secret_key"
             )
+        if self.fallback_bucket_name and self.fallback_cdn_url:
+            raise CustomerConfigError("set either fallback_bucket_name or fallback_cdn_url, not both")
+        if self.fallback_cdn_url and not str(self.fallback_cdn_url).startswith(("https://", "http://")):
+            raise CustomerConfigError("fallback_cdn_url must be an http(s) URL")
 
     def origins(self) -> List[object]:
         """The origins to read originals from, in the order they are tried."""
@@ -559,6 +567,8 @@ class Customer(object):
                     private=self.fallback_bucket_private,
                 )
             )
+        elif self.fallback_cdn_url:
+            result.append(prism_origins.HttpOrigin(name="fallback", base_url=self.fallback_cdn_url))
         return result
 
 
