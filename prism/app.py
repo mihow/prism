@@ -10,7 +10,7 @@ import sentry_sdk
 from boto.s3.key import Key
 from requests import HTTPError
 from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
-from werkzeug.exceptions import BadRequest, HTTPException, NotFound
+from werkzeug.exceptions import BadGateway, BadRequest, HTTPException, InternalServerError, NotFound
 
 # from werkzeug.contrib.fixers import ProxyFix
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -20,11 +20,18 @@ from werkzeug.wrappers import Request, Response
 
 import prism.core as core
 import prism.settings as settings
+from prism import origins as prism_origins
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "WARNING").upper())
+if settings.ORIGINS_LOG_LEVEL:
+    logging.getLogger("prism.origins").setLevel(settings.ORIGINS_LOG_LEVEL.upper())
+prism_origins.install_log_scrubbing()
 logger = logging.getLogger(__name__)
 
-sentry_sdk.init()  # uses SENTRY_DSN env var
+sentry_sdk.init(  # uses SENTRY_DSN env var
+    before_send=prism_origins.sentry_before_send,
+    before_breadcrumb=prism_origins.sentry_before_breadcrumb,
+)
 
 
 class App(object):
@@ -72,6 +79,10 @@ class App(object):
                 f"Customer '{subdomain}' not found. Request host: {request.host}"
             )
             raise NotFound()
+        except CustomerConfigError as e:
+            logger.error("Customer '%s' has an invalid configuration: %s", subdomain, e)
+            sentry_sdk.capture_exception()
+            raise InternalServerError("The customer configuration is invalid.")
         return customer
 
     def main(self, request):
@@ -86,10 +97,7 @@ class App(object):
 
         customer = self.get_customer(request)
         if extension == ".gif" and request.args.get("out", "gif") == "gif":
-            for origin in customer.origins():
-                if core.check_s3_object_exists(origin.url(path, method="HEAD")):
-                    return redirect(origin.url(path))
-            raise NotFound()
+            return gif_passthrough(path, customer)
 
         if args["command"] == "info":
             return info(path, args, customer)
@@ -175,43 +183,47 @@ def fetch_image(original_url):
         raise BadRequest(e.message)
 
 
+_READ_FAILED_EXCEPTIONS = {400: BadRequest, 404: NotFound, 502: BadGateway}
+
+
+def _http_exception(error: prism_origins.ReadFailed) -> HTTPException:
+    exception_class = _READ_FAILED_EXCEPTIONS.get(error.status, BadGateway)
+    if exception_class is NotFound:
+        return NotFound()
+    return exception_class(error.reason)
+
+
 def fetch_original(path, customer):
     """Fetch an original image, trying the customer's origins in order.
 
-    The next origin is tried only when the current one does not have a usable copy of the
-    file: it is missing, empty, or not a valid image (an interrupted copy). Any other failure,
-    such as a 5xx or a credentials error on a private bucket, is raised, so that a broken
-    primary origin shows up as errors instead of quietly moving all traffic to the fallback.
-    Each fetch logs which origin served the original, which is how the size of the gap
-    between the primary and the fallback bucket is measured.
+    The rules for when the next origin is tried are in prism/origins.py: a missing, empty or
+    undecodable original moves on quietly; an unreachable origin or a 5xx moves on loudly
+    (WARNING and Sentry); a misconfigured origin (NoSuchBucket, refused credentials) answers
+    502 without falling back. When no origin can serve the original the answer is 404 if it
+    is missing everywhere, 400 if a copy exists but is empty or not decodable, and 502 if an
+    origin could not be read.
     """
-    origins = customer.origins()
-    for i, origin in enumerate(origins):
-        is_last = i == len(origins) - 1
-        try:
-            im = core.fetch_image(origin.url(path))
-        except HTTPError as e:
-            status = e.response.status_code
-            # Anonymous S3 requests get 403 for a missing key when the caller may not list the
-            # bucket, so 403 means "missing" only for public origins. For a private origin
-            # it means our credentials were refused.
-            if status == 404 or (status == 403 and not origin.private):
-                miss_reason = str(status)
-            else:
-                raise
-        except core.EmptyOriginalFile as e:
-            if is_last:
-                raise BadRequest(e.message)
-            miss_reason = "empty"
-        except core.InvalidImageError as e:
-            if is_last:
-                raise BadRequest(e.message)
-            miss_reason = "invalid"
-        else:
-            logger.info("original served by origin=%s bucket=%s path=%s", origin.name, origin.bucket_name, path)
-            return im
-        logger.info("original missing on origin=%s bucket=%s reason=%s path=%s", origin.name, origin.bucket_name, miss_reason, path)
-    raise NotFound()
+    try:
+        original = prism_origins.read_original(path, customer.origins())
+    except prism_origins.ReadFailed as e:
+        raise _http_exception(e)
+    return original.image
+
+
+def gif_passthrough(path, customer):
+    """Redirect to the original GIF on the first origin that has it, using the same rules.
+
+    A private origin is redirected to with a short-lived signed URL, so that redirect is
+    marked ``Cache-Control: no-store``; a cached copy would outlive the signature.
+    """
+    try:
+        origin = prism_origins.locate_original(path, customer.origins())
+    except prism_origins.ReadFailed as e:
+        raise _http_exception(e)
+    response = redirect(origin.url(path))
+    if origin.private:
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 def process(path, args, customer):
@@ -444,6 +456,31 @@ def clear_old_tmp_files():
             pass
 
 
+class CustomerConfigError(ValueError):
+    """A customer's entry in credentials.json is inconsistent."""
+
+
+_TRUE_STRINGS = ("true", "1", "yes", "on")
+_FALSE_STRINGS = ("false", "0", "no", "off", "")
+
+
+def _as_bool(value, name):
+    """Read a boolean setting, accepting JSON booleans and the usual strings ("true", "0"...)."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise CustomerConfigError(f"{name} must be true or false, got {value!r}")
+
+
 class Customer(object):
     def __init__(
         self,
@@ -478,7 +515,7 @@ class Customer(object):
         self.write_bucket_endpoint_url = (
             write_bucket_endpoint_url or read_bucket_endpoint_url
         )
-        self.read_bucket_private = read_bucket_private
+        self.read_bucket_private = _as_bool(read_bucket_private, "read_bucket_private")
         # Optional second source of originals, tried when the read bucket does not have the
         # file. Used while originals are migrated between buckets and only some are copied.
         self.fallback_bucket_name = fallback_bucket_name
@@ -486,12 +523,21 @@ class Customer(object):
         self.fallback_bucket_secret_key = fallback_bucket_secret_key
         self.fallback_bucket_region = fallback_bucket_region
         self.fallback_bucket_endpoint_url = fallback_bucket_endpoint_url
-        self.fallback_bucket_private = fallback_bucket_private
+        self.fallback_bucket_private = _as_bool(fallback_bucket_private, "fallback_bucket_private")
+        self._validate()
 
-    def origins(self) -> List["Origin"]:
-        """The buckets to read originals from, in the order they are tried."""
-        origins = [
-            Origin(
+    def _validate(self):
+        if self.read_bucket_private and not (self.read_bucket_key_id and self.read_bucket_secret_key):
+            raise CustomerConfigError("read_bucket_private requires read_bucket_key_id and read_bucket_secret_key")
+        if self.fallback_bucket_private and not (self.fallback_bucket_key_id and self.fallback_bucket_secret_key):
+            raise CustomerConfigError(
+                "fallback_bucket_private requires fallback_bucket_key_id and fallback_bucket_secret_key"
+            )
+
+    def origins(self) -> List[object]:
+        """The origins to read originals from, in the order they are tried."""
+        result = [
+            prism_origins.S3Origin(
                 name="read",
                 bucket_name=self.read_bucket_name,
                 region=self.read_bucket_region,
@@ -502,8 +548,8 @@ class Customer(object):
             )
         ]
         if self.fallback_bucket_name:
-            origins.append(
-                Origin(
+            result.append(
+                prism_origins.S3Origin(
                     name="fallback",
                     bucket_name=self.fallback_bucket_name,
                     region=self.fallback_bucket_region,
@@ -513,35 +559,11 @@ class Customer(object):
                     private=self.fallback_bucket_private,
                 )
             )
-        return origins
+        return result
 
 
-class Origin(object):
-    """A bucket that originals are read from.
-
-    Public buckets are read with a plain URL. Private buckets (``private: true`` in the
-    customer credentials) are read with a short-lived signed URL made from the bucket's keys.
-    """
-
-    def __init__(self, name, bucket_name, region, endpoint_url, key_id, secret_key, private):
-        self.name = name
-        self.bucket_name = bucket_name
-        self.region = region
-        self.endpoint_url = endpoint_url
-        self.key_id = key_id
-        self.secret_key = secret_key
-        self.private = private
-
-    def url(self, path, method="GET"):
-        if self.private:
-            s3_config = core.S3ConnectionConfig(
-                key_id=self.key_id,
-                secret_key=self.secret_key,
-                region=self.region,
-                endpoint_url=self.endpoint_url,
-            )
-            return core.get_signed_s3_url(self.bucket_name, path, s3_config, method=method)
-        return core.get_s3_url(self.bucket_name, self.region, path, endpoint=self.endpoint_url)
+# Kept for code that imported the origin class from here.
+Origin = prism_origins.S3Origin
 
 
 class CredentialsStore(object):

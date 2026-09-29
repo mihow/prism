@@ -142,7 +142,8 @@ def split_endpoint_url(endpoint_url: str) -> typing.Tuple[str, int, bool]:
 class S3ConnectionConfig:
     """Config for connecting to S3 with fallback to environment variables."""
     key_id: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_ACCESS_KEY_ID'))
-    secret_key: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_SECRET_ACCESS_KEY'))
+    # repr=False keeps the secret out of logs and out of Sentry's captured local variables.
+    secret_key: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_SECRET_ACCESS_KEY'), repr=False)
     region: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_REGION'))
     endpoint_url: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'S3_ENDPOINT_URL'))
 
@@ -221,7 +222,7 @@ def get_signed_s3_url(bucket_name: str, path: str, s3_config: S3ConnectionConfig
 def fetch_image(url):
     s = requests.Session()
     s.mount('https://', HTTPAdapter(max_retries=retries))
-    print(f"Fetching {url.split('?')[0]}")  # the query string may hold a signature
+    logger.debug("Fetching %s", url.split('?')[0])  # the query string may hold a signature
     r = s.get(url, timeout=5.0)
     t = r.elapsed.total_seconds()
     logging.info('S3 GET request time: %0.2f', t)
