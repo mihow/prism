@@ -111,19 +111,84 @@ WARNING: This file must not be publicly accessible!
 
 Note: `write_bucket_*` parameters may be included to separate read and write buckets.
 
-#### Private read buckets and a fallback bucket
+#### Private read buckets and a fallback origin
 Prism fetches originals with a plain GET, so by default the read bucket must allow public reads.
 Set `"read_bucket_private": true` to fetch originals with a short-lived signed URL made from the
-`read_bucket_key_id` and `read_bucket_secret_key` instead.
+`read_bucket_key_id` and `read_bucket_secret_key` instead (both are then required). That key must be
+allowed to list the bucket: without list permission, S3-compatible stores answer a request for a
+missing key with 403 instead of 404, and Prism treats a 403 from a private bucket as refused
+credentials.
 
-A customer may also name a second bucket of originals with `fallback_bucket_name` (plus the
-optional `fallback_bucket_region`, `fallback_bucket_endpoint_url`, `fallback_bucket_key_id`,
-`fallback_bucket_secret_key` and `fallback_bucket_private`). This is meant for migrating originals
-from one bucket to another while only some have been copied: Prism reads from the read bucket
-first and tries the fallback only when the original is missing there, or is empty or not a valid
-image. Server errors and refused credentials are raised rather than falling back, so a broken
-read bucket stays visible. Each fetch logs which bucket served the original (at `INFO`; set
-`LOG_LEVEL=INFO` to see these lines).
+A customer may also name a fallback origin that holds originals the read bucket does not have yet,
+for example while originals are migrated from one object store to another. The fallback is either a
+second bucket (`fallback_bucket_name`, plus the optional `fallback_bucket_region`,
+`fallback_bucket_endpoint_url`, `fallback_bucket_key_id`, `fallback_bucket_secret_key` and
+`fallback_bucket_private`) or an HTTP(S) base URL, such as a CDN distribution in front of the old
+bucket (`fallback_cdn_url`; Prism requests `<fallback_cdn_url>/<key>` anonymously). Set one or the
+other, not both.
+
+What Prism does depends on how the read bucket answers:
+
+| Read bucket answer | What Prism does |
+|---|---|
+| The original | Serves it; the fallback is not contacted |
+| 404 `NoSuchKey`, or 403 from a public bucket | Tries the fallback (logged at `INFO`) |
+| An original that is empty, shorter than its `Content-Length`, or not decodable as an image | Tries the fallback (logged at `INFO`) |
+| Connection error, timeout, 429 or 5xx, after one retry | Tries the fallback, loudly: a `WARNING` and a Sentry event (at most one event per origin per minute) |
+| 404 `NoSuchBucket`, 403 from a private bucket, a redirect, or any other 4xx | Answers 502 without trying the fallback, logged at `ERROR` and sent to Sentry, so a misconfigured read bucket does not quietly send every request to the fallback |
+
+When no origin can serve the original, Prism answers 404 if it is missing everywhere, 400 if a copy
+exists but is empty or not decodable (with the same messages as before), and 502 if an origin could
+not be read. Decoding does not catch every damaged file: ImageMagick decodes a JPEG that is cut
+short, so a truncated copy in the read bucket is served as it is.
+
+The GIF passthrough (`.gif` requested without `out=`) follows the same rules with a HEAD request
+and redirects to the origin that has the file. A redirect to a private bucket carries a signed URL
+and is sent with `Cache-Control: no-store`.
+
+#### Copying fallback reads into the read bucket
+With `"fallback_write_back": true`, an original that was served by the fallback is copied into the
+read bucket under the same key, so the next request for it does not reach the fallback again. The
+copy uses the read bucket's key and secret (so both are required), and it happens in background
+threads after the response is sent: a slow or failing write never delays or fails a request.
+
+- Only the original bytes are copied, never a resized image, and only when they decoded as an
+  image, their length matches the fallback's `Content-Length`, and their MD5 matches the fallback's
+  `ETag` when that ETag is a plain MD5 (single-part uploads).
+- A copy already in the read bucket is left alone, unless it is the empty or undecodable copy that
+  was just read there, which is replaced. The check is a HEAD before the PUT; the PUT carries
+  `Content-MD5` and the fallback's `Content-Type`.
+- Nothing is copied when the read bucket was unreachable rather than missing the file.
+- The queue is bounded (`WRITE_BACK_QUEUE_SIZE` jobs and `WRITE_BACK_MAX_PENDING_MB` of bytes per
+  worker process). When it is full the copy is dropped and logged; the next request for that
+  original reads the fallback and queues it again. Jobs still queued when a worker process exits
+  are lost the same way.
+
+Each copy is logged on `prism.origins` with its outcome: `written`, `replaced-broken`, `exists`,
+`skipped` (the bytes could not be verified), `failed` (with the reason) or `dropped`.
+
+#### Origin logging and settings
+Everything about origins is logged on the `prism.origins` logger. Set `ORIGINS_LOG_LEVEL=INFO` to see
+which origin served each original, and each copy, without raising `LOG_LEVEL` for everything else.
+Each worker process also logs its counters (originals served per origin, misses, write-back outcomes)
+at most every `ORIGIN_STATS_INTERVAL` seconds, for example
+`origin stats pid=12 read.missing=40 served.fallback=40 served.read=960 write_back.written=38 ...`.
+Signed-URL signatures and access key ids are redacted from these logs, from urllib3's retry
+warnings and from Sentry events.
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `ORIGIN_CONNECT_TIMEOUT` | `3` | Seconds to wait for a connection to an origin |
+| `ORIGIN_READ_TIMEOUT` | `5` | Seconds to wait between bytes from an origin |
+| `ORIGIN_RETRIES` | `1` | Retries per origin request on connection errors, timeouts and 500/502/503/504 |
+| `ORIGINS_LOG_LEVEL` | unset | Level for the `prism.origins` logger alone |
+| `ORIGIN_STATS_INTERVAL` | `300` | Seconds between counter log lines per worker process |
+| `WRITE_BACK_WORKERS` | `2` | Background copy threads per worker process |
+| `WRITE_BACK_QUEUE_SIZE` | `64` | Copies waiting per worker process |
+| `WRITE_BACK_MAX_PENDING_MB` | `256` | Bytes waiting per worker process |
+
+Existing customers see two differences: an origin that answers 5xx or cannot be reached now gives
+502 instead of an unhandled 500, and origin requests are retried once instead of five times.
 
 ```
 {
@@ -135,8 +200,8 @@ read bucket stays visible. Each fetch logs which bucket served the original (at 
         "read_bucket_secret_key": "...",
         "read_bucket_private": true,
         "write_bucket_name": "foo-thumbnails",
-        "fallback_bucket_name": "foo-originals-old",
-        "fallback_bucket_region": "us-east-1"
+        "fallback_cdn_url": "https://d111111abcdef8.cloudfront.net",
+        "fallback_write_back": true
     }
 }
 ```
