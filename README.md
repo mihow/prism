@@ -173,9 +173,11 @@ writes otherwise shows up only as continued fallback traffic.
 #### Origin logging and settings
 Everything about origins is logged on the `prism.origins` logger. Set `ORIGINS_LOG_LEVEL=INFO` to see
 which origin served each original, and each copy, without raising `LOG_LEVEL` for everything else.
-Each worker process also logs its counters (originals served per origin, misses, write-back outcomes)
-at most every `ORIGIN_STATS_INTERVAL` seconds, for example
-`origin stats pid=12 read.missing=40 served.fallback=40 served.read=960 write_back.written=38 ...`.
+Each worker process also logs its counters (originals served per origin, misses, bytes read from
+the fallback, write-back outcomes) at most every `ORIGIN_STATS_INTERVAL` seconds, for example
+`origin stats pid=12 fallback.bytes=36864000 read.missing=40 served.fallback=40 served.read=960 write_back.written=38 ...`.
+`fallback.bytes` is the total size of the originals the fallback served, for a fallback billed by
+transfer; it does not include failed or undecodable reads.
 Signed-URL signatures and access key ids are redacted from these logs, from urllib3's retry
 warnings and from Sentry events.
 

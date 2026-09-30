@@ -204,6 +204,27 @@ class TestFallbackRules(OriginTestCase):
         self.assertEqual(self.http.called(), [("GET", "read"), ("GET", "fallback")])
         self.assertEqual(origins.STATS.snapshot()["served.fallback"], 1)
 
+    def test_bytes_read_from_the_fallback_are_counted(self):
+        self.use_http({("GET", "read"): [s3_error(404, "NoSuchKey")] * 2, ("GET", "fallback"): [image(), image(OTHER_JPEG)]})
+        fetch_original(PATH, make_customer())
+        fetch_original(PATH, make_customer())
+        self.assertEqual(origins.STATS.snapshot()["fallback.bytes"], len(JPEG) + len(OTHER_JPEG))
+
+    def test_bytes_read_from_the_primary_are_not_counted_as_fallback_bytes(self):
+        self.fetch({("GET", "read"): image()})
+        self.assertNotIn("fallback.bytes", origins.STATS.snapshot())
+
+    def test_broken_fallback_reads_are_not_counted_as_fallback_bytes(self):
+        with self.assertRaises(BadRequest):
+            self.fetch({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image(b"junk")})
+        self.assertNotIn("fallback.bytes", origins.STATS.snapshot())
+
+    def test_fallback_bytes_appear_in_the_stats_log_line(self):
+        self.fetch({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image()})
+        with self.assertLogs("prism.origins", level="INFO") as logs:
+            origins.STATS.log_now()
+        self.assertIn(f"fallback.bytes={len(JPEG)}", logs.output[-1])
+
     def test_primary_miss_logs_the_s3_error_code(self):
         with self.assertLogs("prism.origins", level="INFO") as logs:
             self.fetch({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image()})
@@ -372,6 +393,7 @@ class TestCdnFallback(OriginTestCase):
         cdn_call = self.http.calls[1]
         self.assertEqual(cdn_call.url, f"{CDN}/{PATH}")
         self.assertNotIn("Signature", cdn_call.url)
+        self.assertEqual(origins.STATS.snapshot()["fallback.bytes"], len(JPEG))
 
     def test_cdn_403_is_a_miss(self):
         self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "cdn"): s3_error(403, "AccessDenied")})

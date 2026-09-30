@@ -148,7 +148,8 @@ def sentry_before_breadcrumb(crumb: Dict[str, Any], hint: Dict[str, Any]) -> Dic
 
 
 class OriginStats:
-    """In-process counters of which origin served originals and what write-back did.
+    """In-process counters of which origin served originals, how many bytes the fallback served,
+    and what write-back did.
 
     Each uWSGI worker process keeps its own counters and logs them on ``prism.origins`` at INFO
     at most every ``interval`` seconds (checked when a counter changes), so the size of the
@@ -526,6 +527,9 @@ def read_original(path: str, origins: List[Any], write_back: Optional["WriteBack
     Queueing never raises and never delays the response.
     """
     origin, original, failures = _try_origins(origins, path, fetch)
+    if origin is not origins[0]:
+        # Where the fallback is billed by transfer, bytes matter more than request counts.
+        STATS.incr("fallback.bytes", len(original.data))
     if write_back is not None and origin is not origins[0] and failures:
         primary_failure = failures[0]
         if isinstance(primary_failure, (OriginMissing, OriginBroken)):
