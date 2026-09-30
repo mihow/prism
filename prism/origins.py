@@ -195,18 +195,29 @@ STATS = OriginStats(interval=settings.ORIGIN_STATS_INTERVAL)
 # At most one Sentry event per (origin, kind) per this many seconds: an outage of the read
 # bucket would otherwise send one event per request.
 SENTRY_MIN_INTERVAL = 60.0
+# At most one Sentry event per (bucket, kind of failure) per this many seconds for write-back,
+# where one refused key usually means every copy is refused.
+WRITE_BACK_SENTRY_MIN_INTERVAL = 300.0
 _sentry_lock = threading.Lock()
 _sentry_last_sent: Dict[str, float] = {}
 
 
-def _capture(exc: BaseException, key: str) -> None:
+def _capture(exc: BaseException, key: str, interval: float = SENTRY_MIN_INTERVAL) -> None:
+    """Send ``exc`` to Sentry unless an event with the same ``key`` was sent within ``interval``.
+
+    Without a configured DSN this does nothing, and an error inside the Sentry client is logged
+    rather than raised, so reporting can never break a request or a write-back thread.
+    """
     now = time.monotonic()
     with _sentry_lock:
         last = _sentry_last_sent.get(key)
-        if last is not None and now - last < SENTRY_MIN_INTERVAL:
+        if last is not None and now - last < interval:
             return
         _sentry_last_sent[key] = now
-    sentry_sdk.capture_exception(exc)
+    try:
+        sentry_sdk.capture_exception(exc)
+    except Exception:
+        logger.exception("could not send an event to Sentry: key=%s", key)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -309,6 +320,15 @@ class OriginUnavailable(OriginError):
 
 class OriginMisconfigured(OriginError):
     kind = "misconfigured"
+
+
+class WriteBackFailed(Exception):
+    """Sent to Sentry when the read bucket refused a write-back copy.
+
+    That is a HEAD or PUT answered with an error, or a stored ETag that does not match the bytes
+    sent. The message holds the bucket and the reason but not the key, so every failure of one
+    kind is grouped into one Sentry issue.
+    """
 
 
 class ReadFailed(Exception):
@@ -706,13 +726,19 @@ class WriteBackQueue:
             self._process(job)
 
     def _process(self, job: WriteBackJob) -> None:
+        # A failed copy is re-read from the fallback on the next request, so without a Sentry
+        # event a read bucket that refuses writes shows up only as more fallback traffic.
+        # ``kind`` groups the failures for throttling: the HEAD/PUT status, "unavailable", or
+        # the exception type.
+        error: Optional[BaseException] = None
+        kind = None
         try:
             outcome, detail = write_back_one(job)
+            kind = detail
         except OriginUnavailable as e:
-            outcome, detail = "failed", e.reason
+            outcome, detail, error, kind = "failed", e.reason, e, "unavailable"
         except Exception as e:
-            outcome, detail = "failed", scrub(f"{type(e).__name__}: {e}")
-            _capture(e, "write_back:error")
+            outcome, detail, error, kind = "failed", scrub(f"{type(e).__name__}: {e}"), e, type(e).__name__
         finally:
             with self._lock:
                 self._pending_keys.discard(job.key)
@@ -721,6 +747,10 @@ class WriteBackQueue:
         level = logging.WARNING if outcome == "failed" else logging.INFO
         logger.log(level, "write-back %s: %s bucket=%s path=%s", outcome, detail, job.target.bucket_name, job.key)
         self.stats.incr(f"write_back.{outcome}")
+        if outcome == "failed":
+            if error is None:
+                error = WriteBackFailed(f"write-back failed: {detail} bucket={job.target.bucket_name}")
+            _capture(error, f"write_back:{job.target.bucket_name}:{kind}", interval=WRITE_BACK_SENTRY_MIN_INTERVAL)
 
     def join(self) -> None:
         self._queue.join()

@@ -27,6 +27,8 @@ from werkzeug.wrappers import Request
 # prism.app builds a credentials store at import time and needs one of these set.
 os.environ.setdefault("S3_BUCKET", "prism-test")
 
+import sentry_sdk  # noqa: E402
+
 from prism import core, origins  # noqa: E402
 from prism.app import (  # noqa: E402
     App,
@@ -42,6 +44,9 @@ with open(os.path.join(TESTS_DIR, "images", "Phyciodes_mylitta_wide.jpeg"), "rb"
     JPEG = _f.read()
 with open(os.path.join(TESTS_DIR, "images", "Phyciodes_mylitta_tall.jpeg"), "rb") as _f:
     OTHER_JPEG = _f.read()
+
+# Kept before any test replaces it with a mock.
+REAL_SENTRY_CAPTURE = sentry_sdk.capture_exception
 
 PATH = "photos/5a1b2c3d4e5f60718293a4b5/0123abcd.jpg"
 CDN = "https://cdn.example.net"
@@ -614,6 +619,92 @@ class TestWriteBack(OriginTestCase):
         self.assertEqual(im.image.width, 500)
         self.assertEqual(im.data, JPEG)
         self.assertEqual(origins.STATS.snapshot()["write_back.failed"], 1)
+
+    def failing_jobs(self, routes, keys):
+        """Run one write-back job per key against ``routes`` and return the log lines."""
+        self.use_http(routes)
+        target = self.wb_customer().write_back_target()
+        for key in keys:
+            self.queue.submit(origins.WriteBackJob(target, key, JPEG, content_length=len(JPEG)))
+        with self.assertLogs("prism.origins", level="INFO") as logs:
+            self.queue.run_pending()
+        return logs.output
+
+    def test_refused_put_is_reported_to_sentry(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): s3_error(403, "AccessDenied"),
+        })
+        self.assertTrue(any("WARNING" in line and "write-back failed" in line for line in self.logs), self.logs)
+        self.assertEqual(origins.STATS.snapshot()["write_back.failed"], 1)
+        self.sentry.assert_called_once()
+        event = self.sentry.call_args.args[0]
+        self.assertIsInstance(event, origins.WriteBackFailed)
+        self.assertIn("PUT 403 AccessDenied", str(event))
+        self.assertIn("bucket=primary", str(event))
+        # The key is left out so that Sentry groups every failure of one kind together.
+        self.assertNotIn(PATH, str(event))
+
+    def test_refused_head_is_reported_to_sentry(self):
+        self.failing_jobs({("HEAD", "read"): head(403)}, ["a.jpg"])
+        self.sentry.assert_called_once()
+        self.assertIn("HEAD 403", str(self.sentry.call_args.args[0]))
+
+    def test_unreachable_read_bucket_during_write_back_is_reported_to_sentry(self):
+        self.failing_jobs({("HEAD", "read"): requests.ConnectionError("down")}, ["a.jpg"])
+        self.sentry.assert_called_once()
+        self.assertIsInstance(self.sentry.call_args.args[0], origins.OriginUnavailable)
+
+    def test_write_back_failures_are_reported_once_per_kind_per_interval(self):
+        now = [1000.0]
+        with mock.patch.object(origins.time, "monotonic", side_effect=lambda: now[0]):
+            logs = self.failing_jobs({
+                ("HEAD", "read"): [head(404), head(404), head(403)],
+                ("PUT", "read"): [s3_error(403, "AccessDenied"), s3_error(403, "AccessDenied")],
+            }, ["a.jpg", "b.jpg", "c.jpg"])
+            # Every failure is still logged and counted; only the Sentry events are throttled.
+            self.assertEqual(len([line for line in logs if "write-back failed" in line]), 3)
+            self.assertEqual(origins.STATS.snapshot()["write_back.failed"], 3)
+            reported = [str(call.args[0]) for call in self.sentry.call_args_list]
+            self.assertEqual(len(reported), 2, reported)
+            self.assertTrue(any("PUT 403 AccessDenied" in text for text in reported))
+            self.assertTrue(any("HEAD 403" in text for text in reported))
+
+            now[0] += origins.WRITE_BACK_SENTRY_MIN_INTERVAL - 1
+            self.failing_jobs({("HEAD", "read"): head(404), ("PUT", "read"): s3_error(403, "AccessDenied")}, ["d.jpg"])
+            self.assertEqual(self.sentry.call_count, 2)
+
+            now[0] += 2
+            self.failing_jobs({("HEAD", "read"): head(404), ("PUT", "read"): s3_error(403, "AccessDenied")}, ["e.jpg"])
+            self.assertEqual(self.sentry.call_count, 3)
+
+    def test_successful_write_back_is_not_reported(self):
+        self.run_write_back({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): response(200),
+        })
+        self.sentry.assert_not_called()
+
+    def test_write_back_failure_without_sentry_configured_is_only_logged(self):
+        # The real client: prism.app initialises Sentry without a DSN here, so capturing does nothing.
+        with mock.patch.object(origins.sentry_sdk, "capture_exception", REAL_SENTRY_CAPTURE):
+            logs = self.failing_jobs({("HEAD", "read"): head(403)}, ["a.jpg"])
+        self.assertTrue(any("write-back failed" in line for line in logs), logs)
+        self.assertEqual(origins.STATS.snapshot()["write_back.failed"], 1)
+
+    def test_an_error_while_reporting_does_not_stop_write_back(self):
+        self.sentry.side_effect = RuntimeError("sentry is broken")
+        logs = self.failing_jobs({
+            ("HEAD", "read"): [head(403), head(404)],
+            ("PUT", "read"): response(200),
+        }, ["a.jpg", "b.jpg"])
+        self.assertTrue(any("write-back failed" in line for line in logs), logs)
+        self.assertTrue(any("write-back written" in line for line in logs), logs)
+        self.assertEqual(self.queue._queue.qsize(), 0)
 
     def test_put_signature_covers_content_type_and_md5(self):
         target = self.wb_customer().write_back_target()

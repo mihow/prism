@@ -165,7 +165,10 @@ threads after the response is sent: a slow or failing write never delays or fail
   are lost the same way.
 
 Each copy is logged on `prism.origins` with its outcome: `written`, `replaced-broken`, `exists`,
-`skipped` (the bytes could not be verified), `failed` (with the reason) or `dropped`.
+`skipped` (the bytes could not be verified), `failed` (with the reason) or `dropped`. A `failed`
+copy is also sent to Sentry, at most once per read bucket and kind of failure (for example
+`PUT 403 AccessDenied`) every five minutes per worker process, because a read bucket that refuses
+writes otherwise shows up only as continued fallback traffic.
 
 #### Origin logging and settings
 Everything about origins is logged on the `prism.origins` logger. Set `ORIGINS_LOG_LEVEL=INFO` to see
