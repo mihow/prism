@@ -137,6 +137,11 @@ What Prism does depends on how the read bucket answers:
 | Connection error, timeout, 429 or 5xx, after one retry | Tries the fallback, loudly: a `WARNING` and a Sentry event (at most one event per origin per minute) |
 | 404 `NoSuchBucket`, 403 from a private bucket, a redirect, or any other 4xx | Answers 502 without trying the fallback, logged at `ERROR` and sent to Sentry, so a misconfigured read bucket does not quietly send every request to the fallback |
 
+A CDN fallback (`fallback_cdn_url`) follows the same rules, except that it answers a missing key
+with 404, so any other error status from it is logged at `WARNING` with the status and the first
+200 characters of the response body. A 403 from the CDN, which usually means an origin policy, a
+firewall rule or an error page rather than a missing file, is still answered with 404 to the client.
+
 When no origin can serve the original, Prism answers 404 if it is missing everywhere, 400 if a copy
 exists but is empty or not decodable (with the same messages as before), and 502 if an origin could
 not be read. Decoding does not catch every damaged file: ImageMagick decodes a JPEG that is cut

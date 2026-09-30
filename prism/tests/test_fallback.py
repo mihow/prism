@@ -397,8 +397,72 @@ class TestCdnFallback(OriginTestCase):
 
     def test_cdn_403_is_a_miss(self):
         self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "cdn"): s3_error(403, "AccessDenied")})
-        with self.assertRaises(NotFound):
-            fetch_original(PATH, self.cdn_customer())
+        with self.assertLogs("prism.origins", level="WARNING"):
+            with self.assertRaises(NotFound):
+                fetch_original(PATH, self.cdn_customer())
+
+    def cdn_logs(self, cdn_answer, error=NotFound):
+        """Fetch through a read-bucket miss and a CDN answering ``cdn_answer``; return the logs."""
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "cdn"): cdn_answer})
+        with self.assertLogs("prism.origins", level="INFO") as logs:
+            with self.assertRaises(error):
+                fetch_original(PATH, self.cdn_customer())
+        return logs.output
+
+    def test_cdn_403_is_logged_as_a_warning_with_the_status_and_body(self):
+        # A CDN answers a missing key with 404, so a 403 means an origin policy, a firewall rule
+        # or a distribution error: the client still gets a 404, but the operator must see it.
+        page = "<html>\n  <head><title>403 Forbidden</title></head>\n  <body>Request blocked. " + "x" * 400 + "</body></html>"
+        logs = self.cdn_logs(response(403, page.encode(), {"Content-Type": "text/html"}))
+        warning, = [line for line in logs if line.startswith("WARNING")]
+        self.assertIn("reason=403: body '<html> <head><title>403 Forbidden</title></head> <body>Request blocked.", warning)
+        excerpt = warning.split("body '", 1)[1].split("'", 1)[0]
+        self.assertEqual(len(excerpt), origins.BODY_EXCERPT_CHARS)
+        self.assertNotIn("\n", warning)
+
+    def test_cdn_404_is_a_quiet_miss(self):
+        logs = self.cdn_logs(response(404, b"<html>Not Found</html>"))
+        self.assertEqual([line for line in logs if line.startswith("WARNING")], [])
+        self.assertTrue(any(line.startswith("INFO") and "missing" in line and "reason=404 " in line for line in logs), logs)
+
+    def test_cdn_server_error_warning_includes_the_body(self):
+        logs = self.cdn_logs(response(503, b"Service Unavailable: origin timed out"), error=BadGateway)
+        self.assertTrue(any(
+            line.startswith("WARNING") and "503: body 'Service Unavailable: origin timed out'" in line for line in logs
+        ), logs)
+
+    def test_cdn_error_body_is_scrubbed_of_signatures(self):
+        body = b"AccessDenied for /photos/a.jpg?X-Amz-Signature=deadbeef&X-Amz-Credential=AKIDEXAMPLE"
+        logs = self.cdn_logs(response(403, body))
+        warning, = [line for line in logs if line.startswith("WARNING")]
+        self.assertNotIn("deadbeef", warning)
+        self.assertNotIn("AKIDEXAMPLE", warning)
+
+    def test_cdn_credentials_in_the_base_url_are_not_logged(self):
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "cdn"): response(403, b"denied")})
+        customer = make_customer(fallback_bucket_name=None, fallback_bucket_region=None,
+                                 fallback_cdn_url="https://user:hunter2@cdn.example.net")
+        with self.assertLogs("prism.origins", level="INFO") as logs:
+            with self.assertRaises(NotFound):
+                fetch_original(PATH, customer)
+        self.assertFalse(any("hunter2" in line for line in logs.output), logs.output)
+        self.assertTrue(any("url=https://cdn.example.net" in line for line in logs.output), logs.output)
+
+    def test_cdn_403_to_a_head_request_is_a_warning(self):
+        self.use_http({("HEAD", "read"): head(404), ("HEAD", "cdn"): head(403)})
+        with self.assertLogs("prism.origins", level="WARNING") as logs:
+            with self.assertRaises(origins.ReadFailed) as ctx:
+                origins.locate_original(PATH, self.cdn_customer().origins())
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertTrue(any("403" in line for line in logs.output), logs.output)
+
+    def test_public_bucket_403_stays_a_quiet_miss(self):
+        # Anonymous S3 callers get 403 AccessDenied for a missing key, so this is routine.
+        self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): s3_error(403, "AccessDenied")})
+        with self.assertLogs("prism.origins", level="INFO") as logs:
+            with self.assertRaises(NotFound):
+                fetch_original(PATH, make_customer())
+        self.assertEqual([line for line in logs.output if line.startswith("WARNING")], [])
 
     def test_bucket_and_cdn_fallback_together_are_rejected(self):
         with self.assertRaises(CustomerConfigError):

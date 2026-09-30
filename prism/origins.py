@@ -7,7 +7,10 @@ original, which origin serves it:
 
 * **Missing** on an origin (404, or 403 from a public origin, which is how S3 answers anonymous
   callers for a missing key) or **broken** there (empty, shorter than its Content-Length, or not
-  decodable as an image): try the next origin quietly, logging the reason at INFO.
+  decodable as an image): try the next origin quietly, logging the reason at INFO. The exception
+  is a 403 from an HTTP origin (a CDN), which answers a missing key with 404: it is still a miss,
+  but logged at WARNING with the start of the response body, since it usually means an origin
+  policy, a firewall rule or an error page.
 * **Unavailable** (connection error, timeout, 429 or 5xx): try the next origin, but loudly, with
   a WARNING and a Sentry event, because every such request costs a fallback read.
 * **Misconfigured** (NoSuchBucket, a 403 from a private origin, a redirect, or any other 4xx): stop and
@@ -278,15 +281,17 @@ class HttpOrigin:
         self.name = name
         self.base_url = base_url.rstrip("/")
         self.bucket_name = None
+        # For logs: the base URL without any user:password@ part.
+        self._display_url = re.sub(r"^([a-zA-Z][a-zA-Z0-9+.-]*://)[^/@]*@", r"\1", self.base_url)
 
     def url(self, path: str, method: str = "GET") -> str:
         return f"{self.base_url}/{urllib.parse.quote(path.lstrip('/'), safe='/')}"
 
     def describe(self) -> str:
-        return f"{self.name} url={self.base_url}"
+        return f"{self.name} url={self._display_url}"
 
     def __repr__(self) -> str:
-        return f"HttpOrigin(name={self.name!r}, base_url={self.base_url!r})"
+        return f"HttpOrigin(name={self.name!r}, base_url={self._display_url!r})"
 
 
 # ---------------------------------------------------------------------------------------------
@@ -299,11 +304,13 @@ class OriginError(Exception):
 
     kind = "error"
 
-    def __init__(self, origin, reason: str, etag: Optional[str] = None):
+    def __init__(self, origin, reason: str, etag: Optional[str] = None, status: Optional[int] = None):
         self.origin = origin
         self.reason = scrub(reason)
         # For a broken copy: the ETag of the copy that was read, so write-back replaces only it.
         self.etag = etag
+        # The HTTP status the origin answered with, when the error came from one.
+        self.status = status
         super().__init__(f"{origin.describe()}: {self.reason}")
 
 
@@ -399,24 +406,56 @@ def s3_error_code(response: requests.Response) -> Optional[str]:
     return match.group(1).decode("ascii") if match else None
 
 
-def classify_status(origin, status: int, code: Optional[str]) -> OriginError:
+BODY_EXCERPT_CHARS = 200
+
+
+def body_excerpt(response: requests.Response) -> str:
+    """The start of a response body on one line, for logs.
+
+    Whitespace is collapsed, signed-URL parameters are redacted, and the result is at most
+    BODY_EXCERPT_CHARS characters long.
+    """
+    try:
+        raw = response.content[:BODY_EXCERPT_CHARS * 4] if response.content else b""
+    except Exception:
+        return ""
+    text = " ".join(raw.decode("utf-8", errors="replace").split())
+    return scrub(text)[:BODY_EXCERPT_CHARS]
+
+
+def classify_status(origin, status: int, code: Optional[str], excerpt: Optional[str] = None) -> OriginError:
     """Turn a non-2xx HTTP status from an origin into the matching OriginError.
 
     Redirects count as misconfiguration: S3 answers a request sent to the wrong regional
-    endpoint with 301 PermanentRedirect.
+    endpoint with 301 PermanentRedirect. ``excerpt``, the start of the response body, is added
+    to the reason after a colon, so the status stays the first part of it.
     """
     label = f"{status} {code}" if code else str(status)
+    if excerpt:
+        label = f"{label}: body {excerpt!r}"
     if status == 404:
         if code == "NoSuchBucket":
-            return OriginMisconfigured(origin, label)
-        return OriginMissing(origin, label)
+            return OriginMisconfigured(origin, label, status=status)
+        return OriginMissing(origin, label, status=status)
     if status == 403:
         if origin.private:
-            return OriginMisconfigured(origin, f"{label}: credentials refused (the key must be allowed to list the bucket)")
-        return OriginMissing(origin, label)
+            return OriginMisconfigured(origin, f"{label}: credentials refused (the key must be allowed to list the bucket)", status=status)
+        return OriginMissing(origin, label, status=status)
     if status == 429 or status >= 500:
-        return OriginUnavailable(origin, label)
-    return OriginMisconfigured(origin, label)
+        return OriginUnavailable(origin, label, status=status)
+    return OriginMisconfigured(origin, label, status=status)
+
+
+def _status_error(origin, response: requests.Response, code: Optional[str]) -> OriginError:
+    """classify_status for a response, with a body excerpt for an HTTP origin's error pages.
+
+    A CDN answers a missing key with 404; for any other error status its body (an origin policy
+    denial, a firewall block page, an error page) is what tells the operator what went wrong.
+    """
+    excerpt = None
+    if isinstance(origin, HttpOrigin) and response.status_code != 404:
+        excerpt = body_excerpt(response)
+    return classify_status(origin, response.status_code, code, excerpt)
 
 
 def _request(origin, method: str, url: str, **kwargs) -> requests.Response:
@@ -432,7 +471,7 @@ def fetch(origin, path: str) -> Original:
     # identity: the bytes must be the stored object exactly, both to decode and to copy back.
     response = _request(origin, "GET", origin.url(path), headers={"Accept-Encoding": "identity"})
     if not 200 <= response.status_code < 300:
-        raise classify_status(origin, response.status_code, s3_error_code(response))
+        raise _status_error(origin, response, s3_error_code(response))
     data = response.content
     etag = response.headers.get("ETag")
     declared = response.headers.get("Content-Length")
@@ -459,7 +498,7 @@ def probe(origin, path: str) -> None:
     """HEAD an original on one origin. Returns if it is there and non-empty, else raises."""
     response = _request(origin, "HEAD", origin.url(path, method="HEAD"))
     if not 200 <= response.status_code < 300:
-        raise classify_status(origin, response.status_code, None)
+        raise _status_error(origin, response, None)
     if response.headers.get("Content-Length") == "0":
         raise OriginBroken(origin, "empty", etag=response.headers.get("ETag"))
 
@@ -500,7 +539,11 @@ def _try_origins(origins: List[Any], path: str, attempt: Callable[[Any, str], An
             STATS.incr(f"{origin.name}.unavailable")
             failures.append(e)
         except (OriginMissing, OriginBroken) as e:
-            logger.info("original %s on origin=%s reason=%s path=%s", e.kind, origin.describe(), e.reason, path)
+            # A miss on an HTTP origin other than a 404 (a 403 from a CDN) is still a miss, but
+            # logged loudly: it usually means the CDN, not the file, is the problem.
+            loud = isinstance(origin, HttpOrigin) and e.status not in (None, 404)
+            level = logging.WARNING if loud else logging.INFO
+            logger.log(level, "original %s on origin=%s reason=%s path=%s", e.kind, origin.describe(), e.reason, path)
             STATS.incr(f"{origin.name}.{e.kind}")
             failures.append(e)
         else:
