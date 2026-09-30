@@ -1111,5 +1111,84 @@ class TestRealHttp(unittest.TestCase):
         self.assertNotIn("Signature=", warning.replace("Signature=[redacted]", ""))
 
 
+# ---------------------------------------------------------------------------------------------
+# Write-back against a real S3-compatible server
+# ---------------------------------------------------------------------------------------------
+
+REAL_S3_ENDPOINT = os.environ.get("TEST_S3_ENDPOINT_URL")
+REAL_S3_BUCKET = os.environ.get("TEST_WRITE_BACK_BUCKET", "prism-test-write-back")
+
+
+@unittest.skipUnless(REAL_S3_ENDPOINT, "set TEST_S3_ENDPOINT_URL (and AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) to run")
+class TestWriteBackAgainstRealS3(unittest.TestCase):
+    """Write-back end to end against a real server such as MinIO or Ceph RGW.
+
+    FakeHttp cannot tell whether the server accepts the SigV2 query signature over Content-Type
+    and Content-MD5, computes the same ETag, or stores keys with spaces, ``+``, unicode or ``#``
+    under the name Prism reads them back with. These tests do, and are skipped without a server.
+    """
+
+    KEYS = ("wb/plain.jpg", "wb/with space.jpg", "wb/a+b.jpg", "wb/ünïcødé.jpg", "wb/hash#1.jpg")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.key_id = os.environ["AWS_ACCESS_KEY_ID"]
+        cls.secret_key = os.environ["AWS_SECRET_ACCESS_KEY"]
+        cls.config = core.S3ConnectionConfig(key_id=cls.key_id, secret_key=cls.secret_key, endpoint_url=REAL_S3_ENDPOINT)
+        conn = core.get_s3_client(cls.config)
+        cls.bucket = conn.lookup(REAL_S3_BUCKET) or conn.create_bucket(REAL_S3_BUCKET)
+
+    def setUp(self):
+        origins._sentry_last_sent.clear()
+        patcher = mock.patch.object(origins.sentry_sdk, "capture_exception")
+        self.sentry = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.target = origins.WriteBackTarget(REAL_S3_BUCKET, "N/A", REAL_S3_ENDPOINT, self.key_id, self.secret_key)
+        self.reader = origins.S3Origin("read", REAL_S3_BUCKET, "N/A", REAL_S3_ENDPOINT, self.key_id, self.secret_key, private=True)
+
+    def job(self, key, **overrides):
+        values = dict(content_type="image/jpeg", etag=f'"{md5_hex(JPEG)}"', content_length=len(JPEG))
+        values.update(overrides)
+        return origins.WriteBackJob(self.target, key, JPEG, **values)
+
+    def test_missing_keys_are_written_and_read_back_byte_for_byte(self):
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                self.bucket.delete_key(key)
+                outcome, detail = origins.write_back_one(self.job(key))
+                self.assertEqual(outcome, "written", detail)
+                original = origins.fetch(self.reader, key)
+                self.assertEqual(original.data, JPEG)
+                self.assertEqual(original.content_type, "image/jpeg")
+                # A single-part PUT: the stored ETag is the plain MD5 of the bytes sent.
+                self.assertEqual(original.etag.strip('"'), md5_hex(JPEG))
+                self.assertEqual(origins.write_back_one(self.job(key))[0], "exists")
+        # Reading back through the same signing code would also pass if every key were stored
+        # under the same wrong name, so check the names in an independent bucket listing.
+        stored = {key.name for key in self.bucket.list(prefix="wb/")}
+        self.assertLessEqual(set(self.KEYS), stored)
+
+    def test_zero_byte_copy_is_replaced(self):
+        key = "wb/empty.jpg"
+        self.bucket.new_key(key).set_contents_from_string(b"")
+        with self.assertRaises(origins.OriginBroken) as ctx:
+            origins.fetch(self.reader, key)
+        outcome, detail = origins.write_back_one(self.job(key, replace_broken=True, broken_etag=ctx.exception.etag))
+        self.assertEqual(outcome, "replaced-broken", detail)
+        self.assertEqual(origins.fetch(self.reader, key).data, JPEG)
+
+    def test_refused_credentials_fail_and_are_reported(self):
+        key = "wb/refused.jpg"
+        self.bucket.delete_key(key)
+        wrong = origins.WriteBackTarget(REAL_S3_BUCKET, "N/A", REAL_S3_ENDPOINT, self.key_id, "not-the-secret")
+        queue = origins.WriteBackQueue(workers=1, max_items=1, max_pending_bytes=len(JPEG), autostart=False)
+        queue.submit(origins.WriteBackJob(wrong, key, JPEG, content_type="image/jpeg", content_length=len(JPEG)))
+        with self.assertLogs("prism.origins", level="WARNING") as logs:
+            queue.run_pending()
+        self.assertTrue(any("write-back failed" in line and "HEAD 403" in line for line in logs.output), logs.output)
+        self.sentry.assert_called_once()
+        self.assertIsNone(self.bucket.get_key(key))
+
+
 if __name__ == "__main__":
     unittest.main()
