@@ -183,15 +183,21 @@ def get_s3_client(config: typing.Optional[S3ConnectionConfig] = None) -> boto.s3
 def get_s3_url(bucket_name, bucket_region, path, endpoint=None):
     """Get the public URL for an S3 object.
 
-    @TODO simplify this when boto v2 is updated to boto v3 
+    The key is percent-encoded, keeping ``/``, so the URL names exactly the stored object: a raw
+    ``#`` or ``?`` would otherwise end the path, and ``+`` would be ambiguous. The URL is used to
+    read originals from a public origin, to check whether a resized image already exists, and as
+    the redirect sent to the client.
+
+    @TODO simplify this when boto v2 is updated to boto v3
     @TODO shouldn't this use signed urls or pull from the bucket directly?
     """
+    path = urllib.parse.quote(path.lstrip("/"), safe="/")
 
     if endpoint:
         url = '{endpoint}/{bucket}/{path}'.format(
             endpoint=endpoint.rstrip("/"),
             bucket=bucket_name,
-            path=path.lstrip("/")
+            path=path
         )
     else:
         # we use region specific urls because s3 virtual hosts don't work with https

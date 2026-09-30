@@ -1031,6 +1031,98 @@ class TestOriginUrls(unittest.TestCase):
             self.assertNotEqual(signature(primary.url(PATH)), signature(primary.url(PATH, method="HEAD")))
 
 
+# Keys with characters that mean something in a URL, and how each must appear in the URL path.
+SPECIAL_KEYS = [
+    ("photos/x/a#b.jpg", "photos/x/a%23b.jpg"),
+    ("photos/x/a?b.jpg", "photos/x/a%3Fb.jpg"),
+    ("photos/x/a b.jpg", "photos/x/a%20b.jpg"),
+    ("photos/x/a+b.jpg", "photos/x/a%2Bb.jpg"),
+    ("photos/x/a%b.jpg", "photos/x/a%25b.jpg"),
+    ("photos/x/été.jpg", "photos/x/%C3%A9t%C3%A9.jpg"),
+]
+
+
+class TestPublicObjectUrls(unittest.TestCase):
+    """A public object URL must name exactly the stored key.
+
+    Resized images are served by redirecting the client to their public URL, and the same URL is
+    used to check whether a resized image already exists. A raw ``#`` or ``?`` in that URL would
+    cut the key short (the rest becomes a fragment or a query string), so the client gets an
+    error and every request regenerates the image.
+    """
+
+    def test_plain_key_is_unchanged(self):
+        key = "prism-images/photos/x/0123abcd.jpg--resize--w__100.jpg"
+        self.assertEqual(
+            core.get_s3_url("thumbs", "N/A", key, endpoint="https://s3.example.org/"),
+            "https://s3.example.org/thumbs/" + key,
+        )
+        self.assertEqual(core.get_s3_url("thumbs", "us-east-1", key), "https://s3.amazonaws.com/thumbs/" + key)
+        self.assertEqual(core.get_s3_url("thumbs", "eu-west-1", key), "https://s3-eu-west-1.amazonaws.com/thumbs/" + key)
+
+    def test_characters_with_a_meaning_in_urls_are_percent_encoded(self):
+        for key, encoded in SPECIAL_KEYS:
+            for kwargs, base in (
+                ({"endpoint": "https://s3.example.org"}, "https://s3.example.org/thumbs/"),
+                ({}, "https://s3.amazonaws.com/thumbs/"),
+            ):
+                with self.subTest(key=key, **kwargs):
+                    url = core.get_s3_url("thumbs", "us-east-1", key, **kwargs)
+                    self.assertEqual(url, base + encoded)
+                    parsed = urllib.parse.urlsplit(url)
+                    self.assertEqual((parsed.query, parsed.fragment), ("", ""))
+                    self.assertEqual(urllib.parse.unquote(parsed.path), "/thumbs/" + key)
+
+    def test_leading_slash_is_dropped_and_bucket_name_is_left_alone(self):
+        url = core.get_s3_url("tenant:thumbs", "N/A", "/a#b.jpg", endpoint="https://s3.example.org")
+        self.assertEqual(url, "https://s3.example.org/tenant:thumbs/a%23b.jpg")
+
+    def test_public_origin_reads_the_whole_key(self):
+        fallback = make_customer().origins()[1]
+        self.assertFalse(fallback.private)
+        self.assertEqual(fallback.url("photos/x/a#b.jpg"), "https://s3.amazonaws.com/fallback/photos/x/a%23b.jpg")
+
+
+class TestVariantRedirect(unittest.TestCase):
+    """The redirect to a resized image, and the check that it exists, keep the whole key."""
+
+    ARGS = {
+        "command": "resize",
+        "options": {
+            "w": 100, "h": None, "q": 95, "crop_width": None, "crop_height": None, "crop_x": None, "crop_y": None,
+            "frame_bg_color": "FFF", "gravity": "center", "preserve_ratio": True, "premultiplied_alpha": None,
+            "filters": None, "opacity": None, "out_format": "jpg",
+        },
+        "with_info": False,
+        "force": False,
+        "debug": False,
+        "no_redirect": False,
+        "no_redirect_nginx": False,
+        "no_redirect_uwsgi": False,
+    }
+
+    def redirect_for(self, key, **args):
+        customer = make_customer(write_bucket_endpoint_url="https://s3.example.org")
+        with mock.patch.object(core, "check_s3_object_exists", return_value=True) as exists:
+            resp = process(key, dict(self.ARGS, **args), customer)
+        (checked_url,), _ = exists.call_args
+        return resp, checked_url
+
+    def test_redirect_location_and_existence_check_name_the_whole_key(self):
+        for key, encoded in SPECIAL_KEYS:
+            for args in ({}, {"no_redirect": True}):
+                with self.subTest(key=key, **args):
+                    resp, checked_url = self.redirect_for(key, **args)
+                    self.assertEqual(resp.status_code, 302)
+                    location = resp.headers["Location"]
+                    self.assertEqual(location, checked_url)
+                    parsed = urllib.parse.urlsplit(location)
+                    self.assertEqual((parsed.query, parsed.fragment), ("", ""))
+                    expected = core.get_thumb_filename(key, "resize", self.ARGS["options"])
+                    self.assertEqual(urllib.parse.unquote(parsed.path), "/thumbs/" + expected)
+                    self.assertIn(encoded.rsplit("/", 1)[-1].rsplit(".", 1)[0], parsed.path)
+
+
 class TestStats(unittest.TestCase):
     def test_counters_are_logged_periodically_on_the_origins_logger(self):
         stats = origins.OriginStats(interval=0)
