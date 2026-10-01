@@ -690,7 +690,15 @@ def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
 
     Outcomes: ``written`` (the key was missing), ``replaced-broken`` (a broken copy was
     overwritten), ``exists`` (a copy is already there and was left alone), ``skipped`` (the
-    fallback bytes could not be verified, so nothing was written) and ``failed``.
+    fallback bytes could not be verified, or the broken copy was removed before it could be
+    replaced, so nothing was written) and ``failed``.
+
+    The HEAD and the PUT are separate requests, so another worker or a bulk copy can write the
+    key in between. The PUT is therefore conditional: ``If-None-Match: *`` when the key was
+    missing, ``If-Match: <ETag of the broken copy>`` when replacing one. A store that answers
+    412 had a new copy written meanwhile, which is left alone. A store that answers 501 does
+    not support conditional writes, and the PUT is repeated without the condition; a store
+    that ignores the headers behaves the same way, without the protection.
     """
     data = job.data
     if not data:
@@ -720,22 +728,36 @@ def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
         if existing_etag != _strip_etag(job.broken_etag):
             return "exists", "the broken copy changed since the read; left alone"
         outcome = "replaced-broken"
+        condition = {"If-Match": f'"{existing_etag}"'}
     elif head.status_code == 404:
         outcome = "written"
+        condition = {"If-None-Match": "*"}
     else:
         return "failed", f"HEAD {classify_status(target, head.status_code, None).reason}"
 
+    # The condition headers are not part of the SigV2 signature, so one URL serves both PUTs.
     headers = {
         "Content-Type": job.content_type or "application/octet-stream",
         "Content-MD5": base64.b64encode(digest.digest()).decode("ascii"),
     }
-    put = _request(target, "PUT", target.url(job.key, method="PUT", headers=headers), data=data, headers=headers)
+    url = target.url(job.key, method="PUT", headers=headers)
+    put = _request(target, "PUT", url, data=data, headers={**headers, **condition})
+    note = ""
+    if put.status_code == 501:
+        put = _request(target, "PUT", url, data=data, headers=headers)
+        note = " (unconditional: the store does not support conditional writes)"
+    if put.status_code == 412:
+        if outcome == "written":
+            return "exists", "a copy appeared during the write; left alone"
+        return "exists", "the broken copy changed during the write; left alone"
+    if put.status_code == 404 and outcome == "replaced-broken" and s3_error_code(put) == "NoSuchKey":
+        return "skipped", "the broken copy was removed during the write"
     if put.status_code >= 300:
         return "failed", f"PUT {put.status_code} {s3_error_code(put) or ''}".strip()
     stored_etag = _strip_etag(put.headers.get("ETag"))
     if stored_etag and _MD5_ETAG_RE.match(stored_etag) and stored_etag != md5_hex:
         return "failed", "stored ETag does not match the bytes sent"
-    return outcome, f"{len(data)} bytes"
+    return outcome, f"{len(data)} bytes{note}"
 
 
 class WriteBackQueue:

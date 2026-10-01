@@ -629,6 +629,72 @@ class TestWriteBack(OriginTestCase):
         self.assertEqual(self.puts(), [])
         self.assertTrue(any("write-back exists" in line and "without an ETag" in line for line in self.logs), self.logs)
 
+    # Conditional writes: the HEAD and the PUT are separate requests, so another worker can
+    # write the key in between. The PUT carries a precondition so that copy is not overwritten.
+
+    def missing_then_put(self, put):
+        return {
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): put,
+        }
+
+    def test_write_to_a_missing_key_is_conditional_on_it_still_being_missing(self):
+        self.run_write_back(self.missing_then_put(response(200)))
+        put, = self.puts()
+        self.assertEqual(put.kwargs["headers"]["If-None-Match"], "*")
+        self.assertNotIn("If-Match", put.kwargs["headers"])
+
+    def test_copy_written_between_head_and_put_is_left_alone(self):
+        self.run_write_back(self.missing_then_put(s3_error(412, "PreconditionFailed")))
+        self.assertEqual(len(self.puts()), 1)
+        self.assertTrue(any("write-back exists" in line and "during the write" in line for line in self.logs), self.logs)
+        self.assertNotIn("write_back.failed", origins.STATS.snapshot())
+        self.sentry.assert_not_called()
+
+    def test_replacing_a_broken_copy_is_conditional_on_its_etag(self):
+        broken = md5_hex(b"garbage")
+        self.run_write_back({
+            ("GET", "read"): image(b"garbage"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=broken, length=7),
+            ("PUT", "read"): response(200),
+        })
+        put, = self.puts()
+        self.assertEqual(put.kwargs["headers"]["If-Match"], f'"{broken}"')
+        self.assertNotIn("If-None-Match", put.kwargs["headers"])
+
+    def test_broken_copy_repaired_between_head_and_put_is_left_alone(self):
+        self.run_write_back({
+            ("GET", "read"): image(b"garbage"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=md5_hex(b"garbage"), length=7),
+            ("PUT", "read"): s3_error(412, "PreconditionFailed"),
+        })
+        self.assertTrue(any("write-back exists" in line and "during the write" in line for line in self.logs), self.logs)
+        self.sentry.assert_not_called()
+
+    def test_broken_copy_removed_between_head_and_put_is_not_recreated(self):
+        self.run_write_back({
+            ("GET", "read"): image(b"garbage"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=md5_hex(b"garbage"), length=7),
+            ("PUT", "read"): s3_error(404, "NoSuchKey"),
+        })
+        self.assertTrue(any("write-back skipped" in line and "removed during the write" in line for line in self.logs), self.logs)
+        self.sentry.assert_not_called()
+
+    def test_store_without_conditional_writes_gets_an_unconditional_put(self):
+        # AWS S3 answered conditional PUTs with 501 NotImplemented until 2024; such a store
+        # still gets the copy, without the protection against a concurrent writer.
+        self.run_write_back(self.missing_then_put([s3_error(501, "NotImplemented"), response(200)]))
+        first, second = self.puts()
+        self.assertEqual(first.kwargs["headers"]["If-None-Match"], "*")
+        self.assertNotIn("If-None-Match", second.kwargs["headers"])
+        self.assertEqual(second.kwargs["data"], JPEG)
+        self.assertTrue(any("write-back written" in line and "unconditional" in line for line in self.logs), self.logs)
+
     def test_undecodable_fallback_is_never_written(self):
         self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image(b"junk")})
         with self.assertRaises(BadRequest):
@@ -1668,6 +1734,35 @@ class TestWriteBackAgainstRealS3(unittest.TestCase):
         outcome, detail = origins.write_back_one(self.job(key, replace_broken=True, broken_etag=ctx.exception.etag))
         self.assertEqual(outcome, "replaced-broken", detail)
         self.assertEqual(origins.fetch(self.reader, key).data, JPEG)
+
+    def write_back_with_a_writer_between_head_and_put(self, job, contents):
+        """Run write_back_one, storing ``contents`` under the job's key just before its PUT."""
+        real_request = origins._request
+
+        def request(origin, method, url, **kwargs):
+            if method == "PUT":
+                self.bucket.new_key(job.key).set_contents_from_string(contents)
+            return real_request(origin, method, url, **kwargs)
+
+        with mock.patch.object(origins, "_request", side_effect=request):
+            return origins.write_back_one(job)
+
+    def test_copy_written_between_head_and_put_is_not_overwritten(self):
+        key = "wb/race-missing.jpg"
+        self.bucket.delete_key(key)
+        outcome, detail = self.write_back_with_a_writer_between_head_and_put(self.job(key), OTHER_JPEG)
+        self.assertEqual(outcome, "exists", detail)
+        self.assertEqual(self.bucket.get_key(key).get_contents_as_string(), OTHER_JPEG)
+
+    def test_broken_copy_repaired_between_head_and_put_is_not_overwritten(self):
+        key = "wb/race-broken.jpg"
+        self.bucket.new_key(key).set_contents_from_string(b"")
+        with self.assertRaises(origins.OriginBroken) as ctx:
+            origins.fetch(self.reader, key)
+        job = self.job(key, replace_broken=True, broken_etag=ctx.exception.etag)
+        outcome, detail = self.write_back_with_a_writer_between_head_and_put(job, OTHER_JPEG)
+        self.assertEqual(outcome, "exists", detail)
+        self.assertEqual(self.bucket.get_key(key).get_contents_as_string(), OTHER_JPEG)
 
     def test_head_on_a_missing_bucket_is_misconfiguration_not_a_miss(self):
         missing = origins.S3Origin("read", "prism-test-no-such-bucket", "N/A", REAL_S3_ENDPOINT,

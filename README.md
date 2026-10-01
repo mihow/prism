@@ -163,7 +163,11 @@ threads after the response is sent: a slow or failing write never delays or fail
   `ETag` when that ETag is a plain MD5 (single-part uploads).
 - A copy already in the read bucket is left alone, unless it is the empty or undecodable copy that
   was just read there, which is replaced. The check is a HEAD before the PUT; the PUT carries
-  `Content-MD5` and the fallback's `Content-Type`.
+  `Content-MD5` and the fallback's `Content-Type`, and is conditional (`If-None-Match: *` for a
+  missing key, `If-Match` with the broken copy's ETag for a replacement), so a copy written by
+  someone else between the HEAD and the PUT is left alone. MinIO and Ceph RGW honour these
+  headers. A store that answers 501 to them gets an unconditional PUT instead, and a store that
+  ignores them is not protected against that race.
 - Nothing is copied when the read bucket was unreachable rather than missing the file.
 - The queue is bounded (`WRITE_BACK_QUEUE_SIZE` jobs and `WRITE_BACK_MAX_PENDING_MB` of bytes per
   worker process). When it is full the copy is dropped and logged; the next request for that
