@@ -6,6 +6,7 @@ TestRealHttp use a local HTTP server and a closed local port instead, to exercis
 retry adapter and timeouts.
 """
 import base64
+import datetime
 import hashlib
 import http.server
 import logging
@@ -32,6 +33,7 @@ import sentry_sdk  # noqa: E402
 from prism import core, origins  # noqa: E402
 from prism.app import (  # noqa: E402
     App,
+    CredentialsStore,
     Customer,
     CustomerConfigError,
     SingleCustomerCredentialsStore,
@@ -93,6 +95,11 @@ def origin_name(url: str) -> str:
         return "read"
     if parsed.path.startswith("/fallback/"):
         return "fallback"
+    # A second customer's buckets, for the multi-customer tests.
+    if parsed.path.startswith("/primary-b/"):
+        return "read-b"
+    if parsed.path.startswith("/fallback-b/"):
+        return "fallback-b"
     raise AssertionError(f"unexpected URL {url}")
 
 
@@ -149,6 +156,37 @@ def make_customer(**overrides) -> Customer:
     config.update(overrides)
     config = {k: v for k, v in config.items() if v is not None}
     return Customer(**config)
+
+
+# Two customers as a multi-customer deployment holds them in credentials.json: "a" reads from
+# "primary" with the "fallback" bucket and write-back; "b" is an entry written before the fallback
+# settings existed, reading only from "primary-b" on the same endpoint.
+CUSTOMER_A = dict(
+    read_bucket_name="primary",
+    read_bucket_region="N/A",
+    read_bucket_endpoint_url="https://ceph.example.org",
+    read_bucket_key_id="key-a",
+    read_bucket_secret_key="secret-a",
+    read_bucket_private=True,
+    write_bucket_name="thumbs",
+    fallback_bucket_name="fallback",
+    fallback_bucket_region="us-east-1",
+    fallback_write_back=True,
+)
+CUSTOMER_B = dict(
+    read_bucket_name="primary-b",
+    read_bucket_region="N/A",
+    read_bucket_endpoint_url="https://ceph.example.org",
+    write_bucket_name="thumbs-b",
+)
+
+
+def multi_customer_store(default="a", **entries) -> CredentialsStore:
+    """A CredentialsStore holding ``entries`` (default: customers a and b), without S3."""
+    store = CredentialsStore(bucket="secrets", default_customer=default)
+    store.customers_credentials = entries or {"a": dict(CUSTOMER_A), "b": dict(CUSTOMER_B)}
+    store.expiration_time = datetime.datetime.now() + datetime.timedelta(days=1)
+    return store
 
 
 def legacy_customer(**overrides) -> Customer:
@@ -926,6 +964,99 @@ class TestGifPassthrough(OriginTestCase):
         })
         resp = self.app(fallback_bucket_name=None, fallback_cdn_url=CDN).dispatch_request(gif_request(self.GIF))
         self.assertEqual(resp.headers["Location"], f"{CDN}/{self.GIF}")
+
+
+# ---------------------------------------------------------------------------------------------
+# Health check
+# ---------------------------------------------------------------------------------------------
+
+
+def health_request():
+    return Request(EnvironBuilder(method="GET", base_url="http://prism.example.org", path="/elb-health/").get_environ())
+
+
+class TestHealthCheck(OriginTestCase):
+    """/elb-health/ answers 200 when the default customer's TEST_IMAGE can be served under the
+    same origin rules as a request, so an instance that serves from the fallback stays in the
+    load balancer and one with a misconfigured read bucket is taken out."""
+
+    TEST_IMAGE = "health/test.jpg"
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch("prism.app.settings.TEST_IMAGE", self.TEST_IMAGE)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def health(self, routes, store=None):
+        self.use_http(routes)
+        app = App(credentials_store=store or SingleCustomerCredentialsStore(dict(CUSTOMER_A)))
+        return status_of(app.dispatch_request(health_request()))
+
+    def test_test_image_on_the_read_bucket_is_healthy(self):
+        self.assertEqual(self.health({("HEAD", "read"): head(200, length=10)}), 200)
+        self.assertEqual(self.http.called(), [("HEAD", "read")])
+
+    def test_test_image_only_on_the_fallback_is_healthy(self):
+        status = self.health({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("HEAD", "fallback"): head(200, length=10),
+        })
+        self.assertEqual(status, 200)
+
+    def test_unreachable_read_bucket_with_a_working_fallback_is_healthy_but_loud(self):
+        with self.assertLogs("prism.origins", level="WARNING"):
+            status = self.health({
+                ("HEAD", "read"): requests.ConnectionError("down"),
+                ("HEAD", "fallback"): head(200, length=10),
+            })
+        self.assertEqual(status, 200)
+        self.sentry.assert_called_once()
+
+    def test_misconfigured_read_bucket_is_unhealthy_without_trying_the_fallback(self):
+        with self.assertLogs("prism.origins", level="ERROR"):
+            status = self.health({("HEAD", "read"): head(403), ("HEAD", "fallback"): head(200, length=10)})
+        self.assertEqual(status, 500)
+        self.assertEqual(self.http.called(), [("HEAD", "read")])
+
+    def test_test_image_missing_everywhere_is_unhealthy(self):
+        status = self.health({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("HEAD", "fallback"): head(404),
+            ("GET", "fallback"): s3_error(404, "NoSuchKey"),
+        })
+        self.assertEqual(status, 500)
+
+    def test_without_test_image_the_check_fails(self):
+        with mock.patch("prism.app.settings.TEST_IMAGE", None):
+            with self.assertLogs("prism.app", level="ERROR"):
+                self.assertEqual(self.health({}), 500)
+
+    def test_customer_without_a_fallback_is_checked_on_its_read_bucket_only(self):
+        store = SingleCustomerCredentialsStore(dict(CUSTOMER_B))
+        self.assertEqual(self.health({("HEAD", "read-b"): head(200, length=10)}, store), 200)
+        status = self.health({("HEAD", "read-b"): head(404), ("GET", "read-b"): s3_error(404, "NoSuchKey")}, store)
+        self.assertEqual(status, 500)
+        self.assertEqual(self.http.called(), [("HEAD", "read-b"), ("GET", "read-b")])
+
+    def test_multi_customer_check_uses_the_default_customers_origins_only(self):
+        # The default customer has no fallback: its miss is unhealthy, and customer a's buckets
+        # are never contacted.
+        store = multi_customer_store(default="b")
+        status = self.health({("HEAD", "read-b"): head(404), ("GET", "read-b"): s3_error(404, "NoSuchKey")}, store)
+        self.assertEqual(status, 500)
+        self.assertEqual({origin for _, origin in self.http.called()}, {"read-b"})
+        # The default customer has a fallback: its rules apply.
+        store = multi_customer_store(default="a")
+        status = self.health({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("HEAD", "fallback"): head(200, length=10),
+        }, store)
+        self.assertEqual(status, 200)
+        self.assertEqual({origin for _, origin in self.http.called()}, {"read", "fallback"})
 
 
 # ---------------------------------------------------------------------------------------------

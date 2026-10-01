@@ -220,6 +220,13 @@ Existing customers see two differences: an origin that answers 5xx or cannot be 
 ### TEST_IMAGE
 The TEST_IMAGE setting is used to provide an image to be used for the test and health check endpoints. In multi customer mode the DEFAULT_CUSTOMER setting must also be set for the test endpoints to work.
 
+The health check (`/elb-health/`) answers 200 when the default customer's TEST_IMAGE can be served
+under the origin rules above, checked with HEAD requests: a test image that only the fallback holds,
+or a read bucket that is down while the fallback works, still counts as healthy (the outage is
+logged and sent to Sentry as for any request), while a misconfigured read bucket answers 500. Other
+customers are not checked, so one customer's broken entry cannot take every instance out of the
+load balancer. Each check counts as a served original in the origin counters.
+
 ### uWSGI Configuration
 
 The Prism app runs under uWSGI. By default, it runs with 2 processes and 2 threads per process. These settings can be overridden using the UWSGI_PROCESSES and UWSGI_THREADS environment variables. Similarly, other options can be passed to uWSGI using UWSGI_* environment variables.

@@ -114,15 +114,24 @@ class App(object):
         return Response(open("prism/static/test.html"), content_type="text/html")
 
     def elb_health_check(self, request):
-        # If HTTPError occurs or can't find the given image gives Response as 500
+        """200 when the default customer's TEST_IMAGE can be served, else 500.
+
+        The image is located with the same origin rules as a request (HEAD per origin, see
+        prism/origins.py): an instance that serves it from the fallback while the read bucket
+        lacks it or is down stays healthy, and a misconfigured read bucket makes it unhealthy
+        without consulting the fallback. Only the default customer is checked, so one other
+        customer's broken configuration cannot take every instance out of the load balancer.
+        """
+        if not settings.TEST_IMAGE:
+            logger.error("health check failed: TEST_IMAGE is not set")
+            return Response(status=500)
         customer = self.credentials_store.get_default_customer()
-        url = customer.origins()[0].url(settings.TEST_IMAGE, method="HEAD")
         try:
-            if core.check_s3_object_exists(url):
-                return Response("OK")
-        except HTTPError:
-            pass
-        return Response(status=500)
+            prism_origins.locate_original(settings.TEST_IMAGE, customer.origins())
+        except prism_origins.ReadFailed as e:
+            logger.warning("health check failed: %s", e)
+            return Response(status=500)
+        return Response("OK")
 
     def test_info(self, request):
         customer = self.credentials_store.get_default_customer()
