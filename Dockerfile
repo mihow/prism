@@ -1,4 +1,8 @@
-FROM python:3.11-bookworm
+# Pinned by digest (the multi-architecture index of python:3.11-bookworm on 2026-10-01), so a
+# rebuild starts from the same base image; to move to a newer one, replace the digest. The apt
+# packages, uwsgi and the dependencies of requirements.txt are resolved at build time (only the
+# requirements themselves are pinned, by version), so two builds can still differ in those.
+FROM python:3.11-bookworm@sha256:8d9c82537acb2273a53b818d1ca55a3fd4eea6ab2b92f395998b7a5f49fa3cf3
 
 # Development
 RUN apt-get update
