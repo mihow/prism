@@ -1147,10 +1147,33 @@ class TestStats(unittest.TestCase):
 
 
 class _ImageHandler(http.server.BaseHTTPRequestHandler):
+    """Serves the test JPEG for any path, except under ``/redirect/``, which answers 302 to
+    the same key under ``/moved/``, as an origin behind the wrong endpoint or a CDN rule would."""
+
     requests_seen: List[str] = []
+
+    def _redirect(self) -> bool:
+        if not self.path.startswith("/redirect/"):
+            return False
+        self.send_response(302)
+        self.send_header("Location", "/moved/" + self.path[len("/redirect/"):])
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
+
+    def do_HEAD(self):
+        type(self).requests_seen.append(self.path)
+        if self._redirect():
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(JPEG)))
+        self.end_headers()
 
     def do_GET(self):
         type(self).requests_seen.append(self.path)
+        if self._redirect():
+            return
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(JPEG)))
@@ -1201,6 +1224,33 @@ class TestRealHttp(unittest.TestCase):
         warning, = [line for line in logs.output if "unavailable" in line]
         self.assertIn("ConnectionError", warning)
         self.assertNotIn("Signature=", warning.replace("Signature=[redacted]", ""))
+
+    def redirecting_customer(self) -> Customer:
+        # A private read bucket whose requests the local server answers with 302.
+        return Customer(
+            read_bucket_name="redirect",
+            read_bucket_region="N/A",
+            read_bucket_endpoint_url=self.cdn,
+            read_bucket_key_id="key",
+            read_bucket_secret_key="secret",
+            read_bucket_private=True,
+            fallback_cdn_url=self.cdn,
+        )
+
+    def test_redirect_from_an_origin_is_bad_gateway_without_following_it_or_falling_back(self):
+        with self.assertLogs("prism.origins", level="ERROR") as logs:
+            with self.assertRaises(BadGateway) as ctx:
+                fetch_original(PATH, self.redirecting_customer())
+        self.assertIn("302", ctx.exception.description)
+        self.assertEqual([p.split("?")[0] for p in _ImageHandler.requests_seen], ["/redirect/" + PATH])
+        self.assertTrue(any("misconfigured" in line for line in logs.output), logs.output)
+
+    def test_redirect_to_a_head_request_is_bad_gateway_without_following_it_or_falling_back(self):
+        with self.assertLogs("prism.origins", level="ERROR"):
+            with self.assertRaises(origins.ReadFailed) as ctx:
+                origins.locate_original(PATH, self.redirecting_customer().origins())
+        self.assertEqual(ctx.exception.status, 502)
+        self.assertEqual([p.split("?")[0] for p in _ImageHandler.requests_seen], ["/redirect/" + PATH])
 
 
 # ---------------------------------------------------------------------------------------------

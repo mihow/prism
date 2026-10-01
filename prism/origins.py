@@ -459,8 +459,14 @@ def _status_error(origin, response: requests.Response, code: Optional[str]) -> O
 
 
 def _request(origin, method: str, url: str, **kwargs) -> requests.Response:
+    """Send one request to an origin. Redirects are returned, not followed.
+
+    A 3xx from an origin means the request went to the wrong place (S3 answers a request sent
+    to the wrong regional endpoint with a redirect), and classify_status turns it into a 502
+    without fallback. Following it would serve, or write to, whatever the redirect points at.
+    """
     try:
-        return _session().request(method, url, timeout=_timeout(), **kwargs)
+        return _session().request(method, url, timeout=_timeout(), allow_redirects=False, **kwargs)
     except requests.RequestException as e:
         # The exception text holds the full URL; scrub() in OriginError removes signatures.
         raise OriginUnavailable(origin, f"{type(e).__name__}: {e}") from e
