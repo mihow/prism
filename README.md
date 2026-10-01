@@ -148,7 +148,8 @@ not be read. Decoding does not catch every damaged file: ImageMagick decodes a J
 short, so a truncated copy in the read bucket is served as it is.
 
 The GIF passthrough (`.gif` requested without `out=`) follows the same rules with a HEAD request
-and redirects to the origin that has the file. A redirect to a private bucket carries a signed URL
+and redirects to the origin that has the file. A HEAD response has no body, so after a 404 Prism
+sends a one-byte GET to read the S3 error code; a missing bucket then answers 502 here too. A redirect to a private bucket carries a signed URL
 and is sent with `Cache-Control: no-store`.
 
 #### Copying fallback reads into the read bucket

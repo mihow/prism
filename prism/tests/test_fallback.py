@@ -449,7 +449,7 @@ class TestCdnFallback(OriginTestCase):
         self.assertTrue(any("url=https://cdn.example.net" in line for line in logs.output), logs.output)
 
     def test_cdn_403_to_a_head_request_is_a_warning(self):
-        self.use_http({("HEAD", "read"): head(404), ("HEAD", "cdn"): head(403)})
+        self.use_http({("HEAD", "read"): head(404), ("GET", "read"): s3_error(404, "NoSuchKey"), ("HEAD", "cdn"): head(403)})
         with self.assertLogs("prism.origins", level="WARNING") as logs:
             with self.assertRaises(origins.ReadFailed) as ctx:
                 origins.locate_original(PATH, self.cdn_customer().origins())
@@ -848,11 +848,41 @@ class TestGifPassthrough(OriginTestCase):
         return App(credentials_store=SingleCustomerCredentialsStore(config))
 
     def test_missing_on_primary_redirects_to_fallback(self):
-        self.use_http({("HEAD", "read"): head(404), ("HEAD", "fallback"): head(200, length=10)})
+        self.use_http({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("HEAD", "fallback"): head(200, length=10),
+        })
         resp = self.app().dispatch_request(gif_request(self.GIF))
         self.assertEqual(resp.status_code, 302)
         self.assertEqual(resp.headers["Location"], f"https://s3.amazonaws.com/fallback/{self.GIF}")
         self.assertNotIn("Cache-Control", resp.headers)
+        # The GET that reads the error code asks for one byte, in case the file appeared since.
+        get, = [c for c in self.http.calls if c.method == "GET"]
+        self.assertEqual(get.kwargs["headers"]["Range"], "bytes=0-0")
+
+    def test_missing_bucket_behind_a_head_404_is_bad_gateway_not_fallback(self):
+        # A HEAD response has no body, so a 404 does not say whether the key or the bucket is
+        # missing; the S3 error code is read with a GET before the 404 counts as a miss.
+        self.use_http({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): s3_error(404, "NoSuchBucket"),
+            ("HEAD", "fallback"): head(200, length=10),
+        })
+        with self.assertLogs("prism.origins", level="ERROR"):
+            resp = self.app().dispatch_request(gif_request(self.GIF))
+        self.assertEqual(status_of(resp), 502)
+        self.assertIn("NoSuchBucket", resp.description)
+        self.assertEqual(self.http.called(), [("HEAD", "read"), ("GET", "read")])
+
+    def test_original_that_appeared_between_head_and_get_is_redirected_to(self):
+        self.use_http({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): response(206, b"G", {"Content-Range": "bytes 0-0/10"}),
+        })
+        resp = self.app().dispatch_request(gif_request(self.GIF))
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn("/primary/", resp.headers["Location"])
 
     def test_private_primary_redirect_is_signed_and_not_stored(self):
         self.use_http({("HEAD", "read"): head(200, length=10)})
@@ -880,12 +910,20 @@ class TestGifPassthrough(OriginTestCase):
         self.assertTrue(resp.headers["Location"].startswith("https://s3.amazonaws.com/fallback/"))
 
     def test_missing_everywhere_is_not_found(self):
-        self.use_http({("HEAD", "read"): head(404), ("HEAD", "fallback"): head(403)})
+        self.use_http({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("HEAD", "fallback"): head(403),
+        })
         resp = self.app().dispatch_request(gif_request(self.GIF))
         self.assertEqual(status_of(resp), 404)
 
     def test_cdn_fallback_redirects_to_the_cdn(self):
-        self.use_http({("HEAD", "read"): head(404), ("HEAD", "cdn"): head(200, length=10)})
+        self.use_http({
+            ("HEAD", "read"): head(404),
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("HEAD", "cdn"): head(200, length=10),
+        })
         resp = self.app(fallback_bucket_name=None, fallback_cdn_url=CDN).dispatch_request(gif_request(self.GIF))
         self.assertEqual(resp.headers["Location"], f"{CDN}/{self.GIF}")
 
@@ -1329,6 +1367,17 @@ class TestWriteBackAgainstRealS3(unittest.TestCase):
         outcome, detail = origins.write_back_one(self.job(key, replace_broken=True, broken_etag=ctx.exception.etag))
         self.assertEqual(outcome, "replaced-broken", detail)
         self.assertEqual(origins.fetch(self.reader, key).data, JPEG)
+
+    def test_head_on_a_missing_bucket_is_misconfiguration_not_a_miss(self):
+        missing = origins.S3Origin("read", "prism-test-no-such-bucket", "N/A", REAL_S3_ENDPOINT,
+                                   self.key_id, self.secret_key, private=True)
+        with self.assertRaises(origins.OriginMisconfigured) as ctx:
+            origins.probe(missing, "wb/plain.jpg")
+        self.assertIn("NoSuchBucket", ctx.exception.reason)
+        self.bucket.delete_key("wb/absent.jpg")
+        with self.assertRaises(origins.OriginMissing) as ctx:
+            origins.probe(self.reader, "wb/absent.jpg")
+        self.assertIn("NoSuchKey", ctx.exception.reason)
 
     def test_refused_credentials_fail_and_are_reported(self):
         key = "wb/refused.jpg"

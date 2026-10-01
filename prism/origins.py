@@ -501,8 +501,19 @@ def fetch(origin, path: str) -> Original:
 
 
 def probe(origin, path: str) -> None:
-    """HEAD an original on one origin. Returns if it is there and non-empty, else raises."""
+    """HEAD an original on one origin. Returns if it is there and non-empty, else raises.
+
+    A HEAD response has no body, so a 404 does not say whether the key or the bucket is
+    missing. Before a 404 counts as a miss, a one-byte GET reads the S3 error code, so that
+    NoSuchBucket stops with 502 here as it does on the GET path. That GET costs one extra
+    request per miss; a file that appeared in between answers it with 2xx and is used.
+    """
     response = _request(origin, "HEAD", origin.url(path, method="HEAD"))
+    if response.status_code == 404:
+        response = _request(origin, "GET", origin.url(path), headers={"Range": "bytes=0-0"})
+        if 200 <= response.status_code < 300:
+            return
+        raise _status_error(origin, response, s3_error_code(response))
     if not 200 <= response.status_code < 300:
         raise _status_error(origin, response, None)
     if response.headers.get("Content-Length") == "0":
