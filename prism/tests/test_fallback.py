@@ -1,14 +1,16 @@
 """Tests for reading originals from a fallback origin and copying them back to the read bucket.
 
-HTTP is stubbed: origins._session is replaced with FakeHttp, which answers per origin and
-records every request, so these tests run without S3, minio or the network. The two tests in
-TestRealHttp use a local HTTP server and a closed local port instead, to exercise the real
-retry adapter and timeouts.
+Most tests stub HTTP: origins._session is replaced with FakeHttp, which answers per origin and
+records every request, so they run without S3, MinIO or the network. TestRealHttp uses a local
+HTTP server and a closed local port instead, to exercise the real retry adapter, timeouts and
+redirect handling. TestWriteBackAgainstRealS3 and TestMultiCustomerAgainstRealS3 run against an
+S3-compatible server named by TEST_S3_ENDPOINT_URL and are skipped without one.
 """
 import base64
 import datetime
 import hashlib
 import http.server
+import json
 import logging
 import os
 import threading
@@ -24,6 +26,7 @@ from requests.structures import CaseInsensitiveDict
 from werkzeug.exceptions import BadGateway, BadRequest, InternalServerError, NotFound
 from werkzeug.test import EnvironBuilder
 from werkzeug.wrappers import Request
+from wand.image import Image
 
 # prism.app builds a credentials store at import time and needs one of these set.
 os.environ.setdefault("S3_BUCKET", "prism-test")
@@ -1786,6 +1789,135 @@ class TestWriteBackAgainstRealS3(unittest.TestCase):
         self.assertTrue(any("write-back failed" in line and "HEAD 403" in line for line in logs.output), logs.output)
         self.sentry.assert_called_once()
         self.assertIsNone(self.bucket.get_key(key))
+
+
+@unittest.skipUnless(REAL_S3_ENDPOINT, "set TEST_S3_ENDPOINT_URL (and AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY) to run")
+class TestMultiCustomerAgainstRealS3(unittest.TestCase):
+    """Two customers of one multi-customer deployment, each with its own private read bucket,
+    fallback bucket and thumbnail bucket on a real S3-compatible server, picked by subdomain.
+
+    Every bucket is read back with signed requests, so the buckets may be private. A request
+    for one customer must read, write back to and render into only that customer's buckets.
+    """
+
+    DOMAIN = "prism.example.org"
+    PATH = "multi/same-key.jpg"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.key_id = os.environ["AWS_ACCESS_KEY_ID"]
+        cls.secret_key = os.environ["AWS_SECRET_ACCESS_KEY"]
+        conn = core.get_s3_client(core.S3ConnectionConfig(key_id=cls.key_id, secret_key=cls.secret_key,
+                                                          endpoint_url=REAL_S3_ENDPOINT))
+        cls.buckets = {}
+        for customer in ("a", "b"):
+            for role in ("originals", "fallback", "thumbs"):
+                name = f"prism-test-multi-{customer}-{role}"
+                cls.buckets[customer, role] = conn.lookup(name) or conn.create_bucket(name)
+        # Each customer's fallback holds a different image under the same key, so the bytes
+        # show which customer's buckets a request reached.
+        cls.images = {"a": JPEG, "b": OTHER_JPEG}
+
+    def customer_entry(self, customer):
+        def bucket(role):
+            return self.buckets[customer, role].name
+        return dict(
+            read_bucket_name=bucket("originals"),
+            read_bucket_region="N/A",
+            read_bucket_endpoint_url=REAL_S3_ENDPOINT,
+            read_bucket_key_id=self.key_id,
+            read_bucket_secret_key=self.secret_key,
+            read_bucket_private=True,
+            write_bucket_name=bucket("thumbs"),
+            fallback_bucket_name=bucket("fallback"),
+            fallback_bucket_region="N/A",
+            fallback_bucket_endpoint_url=REAL_S3_ENDPOINT,
+            fallback_bucket_key_id=self.key_id,
+            fallback_bucket_secret_key=self.secret_key,
+            fallback_bucket_private=True,
+            fallback_write_back=True,
+        )
+
+    def setUp(self):
+        origins._sentry_last_sent.clear()
+        patcher = mock.patch.object(origins.sentry_sdk, "capture_exception")
+        self.sentry = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.queue = origins.WriteBackQueue(workers=1, max_items=8, max_pending_bytes=10 * 1024 * 1024, autostart=False)
+        patcher = mock.patch.object(origins, "default_write_back_queue", return_value=self.queue)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        patcher = mock.patch("prism.app.settings.DOMAIN", self.DOMAIN)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for customer, data in self.images.items():
+            self.buckets[customer, "originals"].delete_key(self.PATH)
+            self.buckets[customer, "fallback"].new_key(self.PATH).set_contents_from_string(
+                data, headers={"Content-Type": "image/jpeg"})
+            for key in self.buckets[customer, "thumbs"].list(prefix="prism-images/multi/"):
+                key.delete()
+        self.app = App(credentials_store=multi_customer_store(a=self.customer_entry("a"), b=self.customer_entry("b")))
+
+    def get(self, customer, **args):
+        env = EnvironBuilder(method="GET", base_url=f"http://{customer}.{self.DOMAIN}", path="/" + self.PATH,
+                             query_string=urllib.parse.urlencode(args)).get_environ()
+        return self.app.dispatch_request(Request(env))
+
+    def stored(self, customer, role, key=None):
+        found = self.buckets[customer, role].get_key(key or self.PATH)
+        return found.get_contents_as_string() if found is not None else None
+
+    def test_same_path_for_two_customers_is_served_and_written_back_from_each_customers_own_buckets(self):
+        with self.assertLogs("prism.origins", level="INFO"):
+            infos = {customer: self.get(customer, cmd="info") for customer in ("a", "b")}
+        for customer, data in self.images.items():
+            with self.subTest(customer=customer):
+                self.assertEqual(infos[customer].status_code, 200)
+                info = json.loads(infos[customer].get_data())
+                expected = Image(blob=data)
+                self.assertEqual((info["width"], info["height"]), (expected.width, expected.height))
+        # Both copies were queued, although the key is the same.
+        self.assertEqual(self.queue._queue.qsize(), 2)
+        with self.assertLogs("prism.origins", level="INFO") as logs:
+            self.queue.run_pending()
+        self.assertEqual(len([line for line in logs.output if "write-back written" in line]), 2, logs.output)
+        self.assertEqual(self.stored("a", "originals"), JPEG)
+        self.assertEqual(self.stored("b", "originals"), OTHER_JPEG)
+        self.sentry.assert_not_called()
+
+    def test_thumbnails_are_rendered_into_each_customers_own_bucket(self):
+        # One customer at a time, so that a thumbnail appearing in the other customer's bucket
+        # (the names are the same) or a write-back to it would show.
+        for customer, other in (("a", "b"), ("b", "a")):
+            with self.subTest(customer=customer):
+                with self.assertLogs("prism.origins", level="INFO"):
+                    response = self.get(customer, w=100)
+                    self.queue.run_pending()
+                self.assertEqual(response.status_code, 302)
+                location = response.headers["Location"]
+                prefix = f"{REAL_S3_ENDPOINT.rstrip('/')}/{self.buckets[customer, 'thumbs'].name}/"
+                self.assertTrue(location.startswith(prefix), location)
+                thumbnail = urllib.parse.unquote(location[len(prefix):])
+                rendered = Image(blob=self.stored(customer, "thumbs", thumbnail))
+                source = Image(blob=self.images[customer])
+                # The thumbnail keeps the aspect ratio of this customer's original, not the other's.
+                self.assertEqual(rendered.width, 100)
+                self.assertAlmostEqual(rendered.height, 100 * source.height / source.width, delta=1)
+                self.assertEqual(self.stored(customer, "originals"), self.images[customer])
+                if customer == "a":
+                    self.assertIsNone(self.stored(other, "thumbs", thumbnail))
+                    self.assertIsNone(self.stored(other, "originals"))
+
+    def test_one_customers_missing_bucket_does_not_silence_the_others(self):
+        broken = {customer: dict(self.customer_entry(customer), read_bucket_name=f"prism-test-multi-{customer}-absent")
+                  for customer in ("a", "b")}
+        self.app = App(credentials_store=multi_customer_store(**broken))
+        with self.assertLogs("prism.origins", level="ERROR"):
+            for customer in ("a", "b", "a"):
+                self.assertEqual(status_of(self.get(customer, cmd="info")), 502)
+        self.assertEqual(self.sentry.call_count, 2)
+        # Neither customer's fallback was read nor anything written back.
+        self.assertEqual(self.queue._queue.qsize(), 0)
 
 
 if __name__ == "__main__":

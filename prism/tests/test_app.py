@@ -8,7 +8,7 @@ from werkzeug.wrappers import Request
 
 from prism.app import get_dimensions, get_output_format, get_command, make_retina, convert_filters_to_json, get_opacity
 from prism.app import App, CredentialsStore, Customer
-from prism.core import upload_file, S3ConnectionConfig
+from prism.core import get_s3_client, upload_file, S3ConnectionConfig
 from prism import settings
 
 
@@ -61,23 +61,48 @@ class TestApp(unittest.TestCase):
         for customer_name in CUSTOMER_NAMES:
             self.test_images = upload_source_images(self.credentials_store.get_customer(customer_name))
 
-    def test_main(self):
-        app = App(credentials_store=self.credentials_store)
+    def write_bucket(self, customer: Customer):
+        """The customer's thumbnail bucket, opened with its own (signed) credentials."""
+        config = S3ConnectionConfig(
+            key_id=customer.write_bucket_key_id,
+            secret_key=customer.write_bucket_secret_key,
+            region=customer.write_bucket_region,
+            endpoint_url=customer.write_bucket_endpoint_url,
+        )
+        return get_s3_client(config).get_bucket(customer.write_bucket_name)
 
-        for customer_name in CUSTOMER_NAMES:
+    def test_main(self):
+        """Each customer, picked by subdomain, is redirected to a thumbnail in its own write
+        bucket, and the thumbnail is stored there and not in any other customer's bucket."""
+        app = App(credentials_store=self.credentials_store)
+        customers = {name: self.credentials_store.get_customer(name) for name in CUSTOMER_NAMES}
+        self.assertGreater(len({c.write_bucket_name for c in customers.values()}), 1)
+        buckets = {name: self.write_bucket(customer) for name, customer in customers.items()}
+
+        for customer_name, customer in customers.items():
+            location_prefix = f"{customer.write_bucket_endpoint_url.rstrip('/')}/{customer.write_bucket_name}/"
             for image_fname in self.test_images:
-                request = make_image_request(
-                    subdomain=customer_name,
-                    path=f"{image_fname}",
-                    query_args={
-                        "w": 100,
-                        "h": 100
-                    }
-                )
-                print("Request:", request)
-                resp = app.main(request)
-                print("Response:", resp, resp.headers)
-                assert resp.status_code == 302
+                with self.subTest(customer=customer_name, image=image_fname):
+                    request = make_image_request(subdomain=customer_name, path=image_fname, query_args={"w": 100, "h": 100})
+                    resp = app.main(request)
+                    self.assertEqual(resp.status_code, 302)
+                    location = resp.headers["Location"]
+                    self.assertTrue(location.startswith(location_prefix), location)
+
+                    # The thumbnail's name does not depend on the customer, so a copy made for
+                    # another customer would also satisfy the check below. Remove it from every
+                    # bucket and render it again.
+                    thumbnail = urllib.parse.unquote(location[len(location_prefix):])
+                    for bucket in buckets.values():
+                        bucket.delete_key(thumbnail)
+                    resp = app.main(request)
+                    self.assertEqual((resp.status_code, resp.headers["Location"]), (302, location))
+                    for name, bucket in buckets.items():
+                        stored = bucket.get_key(thumbnail)
+                        if bucket.name == customer.write_bucket_name:
+                            self.assertIsNotNone(stored, f"thumbnail missing from {name}'s bucket")
+                        else:
+                            self.assertIsNone(stored, f"thumbnail for {customer_name} found in {name}'s bucket")
 
 
 class TestGetCommand(unittest.TestCase):
