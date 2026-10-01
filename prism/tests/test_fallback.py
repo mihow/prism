@@ -1060,6 +1060,74 @@ class TestHealthCheck(OriginTestCase):
 
 
 # ---------------------------------------------------------------------------------------------
+# Several customers in one process
+# ---------------------------------------------------------------------------------------------
+
+
+def customer_request(customer, path=PATH, **args):
+    """A request for ``path`` addressed to ``customer`` by the ``customer`` query argument."""
+    query = urllib.parse.urlencode({"customer": customer, **args})
+    env = EnvironBuilder(method="GET", base_url="http://prism.example.org", path="/" + path, query_string=query)
+    return Request(env.get_environ())
+
+
+class TestMultiCustomer(OriginTestCase):
+    """A multi-customer deployment serves every customer from the same worker processes, so the
+    Sentry throttle, the write-back queue and the HTTP sessions are shared. One customer's
+    failures must not hide another's, and one customer's requests must never touch another
+    customer's buckets."""
+
+    def app(self, store=None):
+        return App(credentials_store=store or multi_customer_store())
+
+    def test_a_misconfigured_origin_does_not_silence_another_customers_misconfigured_origin(self):
+        self.use_http({("GET", "read"): head(403), ("GET", "read-b"): s3_error(404, "NoSuchBucket")})
+        app = self.app()
+        with self.assertLogs("prism.origins", level="ERROR"):
+            for customer in ("a", "b", "a", "b"):
+                self.assertEqual(status_of(app.dispatch_request(customer_request(customer, cmd="info"))), 502)
+        # One event per read bucket; the repeats within the interval are throttled.
+        self.assertEqual(self.sentry.call_count, 2)
+        reported = [str(call.args[0]) for call in self.sentry.call_args_list]
+        self.assertTrue(any("bucket=primary:" in text for text in reported), reported)
+        self.assertTrue(any("bucket=primary-b:" in text for text in reported), reported)
+
+    def test_an_unavailable_origin_does_not_silence_another_customers_outage(self):
+        self.use_http({
+            ("GET", "read"): requests.ConnectionError("down"),
+            ("GET", "fallback"): image(),
+            ("GET", "read-b"): requests.ConnectionError("down"),
+        })
+        app = self.app()
+        with self.assertLogs("prism.origins", level="WARNING"):
+            self.assertEqual(status_of(app.dispatch_request(customer_request("a", cmd="info"))), 200)
+            self.assertEqual(status_of(app.dispatch_request(customer_request("b", cmd="info"))), 502)
+        self.assertEqual(self.sentry.call_count, 2)
+
+    def test_same_bucket_name_on_another_endpoint_is_a_different_origin(self):
+        here = origins.S3Origin("read", "originals", "N/A", "https://one.example.org", None, None, private=False)
+        there = origins.S3Origin("read", "originals", "N/A", "https://two.example.org", None, None, private=False)
+        same = origins.S3Origin("read", "originals", "N/A", "https://one.example.org", None, None, private=False)
+        self.assertNotEqual(here.identity, there.identity)
+        self.assertEqual(here.identity, same.identity)
+        self.assertNotEqual(origins.HttpOrigin("fallback", "https://a.example.net").identity,
+                            origins.HttpOrigin("fallback", "https://b.example.net").identity)
+
+    def test_write_back_failures_are_reported_per_read_bucket(self):
+        target_a = origins.WriteBackTarget("primary", "N/A", "https://ceph.example.org", "key-a", "secret-a")
+        target_b = origins.WriteBackTarget("primary-b", "N/A", "https://ceph.example.org", "key-b", "secret-b")
+        # A bucket with the same name as customer a's, on another store.
+        target_c = origins.WriteBackTarget("primary", "N/A", "https://other.example.org", "key-c", "secret-c")
+        self.use_http({("HEAD", "read"): head(403), ("HEAD", "read-b"): head(403)})
+        for i, target in enumerate((target_a, target_b, target_c, target_a, target_b, target_c)):
+            self.queue.submit(origins.WriteBackJob(target, f"{i}.jpg", JPEG, content_length=len(JPEG)))
+        with self.assertLogs("prism.origins", level="WARNING"):
+            self.queue.run_pending()
+        self.assertEqual(origins.STATS.snapshot()["write_back.failed"], 6)
+        self.assertEqual(self.sentry.call_count, 3)
+
+
+# ---------------------------------------------------------------------------------------------
 # Configuration and backward compatibility
 # ---------------------------------------------------------------------------------------------
 

@@ -134,7 +134,7 @@ What Prism does depends on how the read bucket answers:
 | The original | Serves it; the fallback is not contacted |
 | 404 `NoSuchKey`, or 403 from a public bucket | Tries the fallback (logged at `INFO`) |
 | An original that is empty, shorter than its `Content-Length`, or not decodable as an image | Tries the fallback (logged at `INFO`) |
-| Connection error, timeout, 429 or 5xx, after one retry | Tries the fallback, loudly: a `WARNING` and a Sentry event (at most one event per origin per minute) |
+| Connection error, timeout, 429 or 5xx, after one retry | Tries the fallback, loudly: a `WARNING` and a Sentry event (at most one event per bucket or CDN per minute and worker process; each customer's buckets are counted separately) |
 | 404 `NoSuchBucket`, 403 from a private bucket, a redirect, or any other 4xx | Answers 502 without trying the fallback, logged at `ERROR` and sent to Sentry, so a misconfigured read bucket does not quietly send every request to the fallback |
 
 A CDN fallback (`fallback_cdn_url`) follows the same rules, except that it answers a missing key
@@ -172,7 +172,8 @@ threads after the response is sent: a slow or failing write never delays or fail
 
 Each copy is logged on `prism.origins` with its outcome: `written`, `replaced-broken`, `exists`,
 `skipped` (the bytes could not be verified), `failed` (with the reason) or `dropped`. A `failed`
-copy is also sent to Sentry, at most once per read bucket and kind of failure (for example
+copy is also sent to Sentry, at most once per read bucket (told apart by endpoint, name and key, so
+customers never share a limit) and kind of failure (for example
 `PUT 403 AccessDenied`) every five minutes per worker process, because a read bucket that refuses
 writes otherwise shows up only as continued fallback traffic.
 

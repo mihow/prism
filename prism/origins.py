@@ -41,7 +41,7 @@ import time
 import urllib.parse
 from dataclasses import dataclass
 from io import BytesIO
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Hashable, List, Optional, Tuple
 
 import requests
 import sentry_sdk
@@ -197,16 +197,18 @@ class OriginStats:
 STATS = OriginStats(interval=settings.ORIGIN_STATS_INTERVAL)
 
 # At most one Sentry event per (origin, kind) per this many seconds: an outage of the read
-# bucket would otherwise send one event per request.
+# bucket would otherwise send one event per request. Origins are told apart by their
+# ``identity`` (store, bucket and key id, or CDN URL), not by their name, because every
+# customer's first origin is called "read".
 SENTRY_MIN_INTERVAL = 60.0
-# At most one Sentry event per (bucket, kind of failure) per this many seconds for write-back,
-# where one refused key usually means every copy is refused.
+# At most one Sentry event per (read bucket, kind of failure) per this many seconds for
+# write-back, where one refused key usually means every copy is refused.
 WRITE_BACK_SENTRY_MIN_INTERVAL = 300.0
 _sentry_lock = threading.Lock()
-_sentry_last_sent: Dict[str, float] = {}
+_sentry_last_sent: Dict[Hashable, float] = {}
 
 
-def _capture(exc: BaseException, key: str, interval: float = SENTRY_MIN_INTERVAL) -> None:
+def _capture(exc: BaseException, key: Hashable, interval: float = SENTRY_MIN_INTERVAL) -> None:
     """Send ``exc`` to Sentry unless an event with the same ``key`` was sent within ``interval``.
 
     Without a configured DSN this does nothing, and an error inside the Sentry client is logged
@@ -261,6 +263,15 @@ class S3Origin:
             return core.get_signed_s3_url(self.bucket_name, path, self.s3_config(), method=method, headers=headers)
         return core.get_s3_url(self.bucket_name, self.region, path, endpoint=self.endpoint_url)
 
+    @property
+    def identity(self) -> Tuple:
+        """Where requests to this origin go and with which key.
+
+        Two customers' origins with the same identity are the same destination, so they share
+        Sentry throttling and write-back de-duplication; any difference keeps them apart.
+        """
+        return ("s3", self.endpoint_url or self.region, self.bucket_name, self.key_id)
+
     def describe(self) -> str:
         return f"{self.name} bucket={self.bucket_name}"
 
@@ -286,6 +297,11 @@ class HttpOrigin:
 
     def url(self, path: str, method: str = "GET") -> str:
         return f"{self.base_url}/{urllib.parse.quote(path.lstrip('/'), safe='/')}"
+
+    @property
+    def identity(self) -> Tuple:
+        """Where requests to this origin go; see S3Origin.identity."""
+        return ("http", self.base_url)
 
     def describe(self) -> str:
         return f"{self.name} url={self._display_url}"
@@ -547,12 +563,12 @@ def _try_origins(origins: List[Any], path: str, attempt: Callable[[Any, str], An
             result = attempt(origin, path)
         except OriginMisconfigured as e:
             logger.error("origin misconfigured, not falling back: origin=%s reason=%s path=%s", origin.describe(), e.reason, path)
-            _capture(e, f"{origin.name}:misconfigured")
+            _capture(e, (origin.name, origin.identity, "misconfigured"))
             STATS.incr(f"{origin.name}.misconfigured")
             raise ReadFailed(502, f"The {origin.name} origin is misconfigured ({e.reason.split(':')[0]}).")
         except OriginUnavailable as e:
             logger.warning("origin unavailable, trying the next one: origin=%s reason=%s path=%s", origin.describe(), e.reason, path)
-            _capture(e, f"{origin.name}:unavailable")
+            _capture(e, (origin.name, origin.identity, "unavailable"))
             STATS.incr(f"{origin.name}.unavailable")
             failures.append(e)
         except (OriginMissing, OriginBroken) as e:
@@ -818,7 +834,7 @@ class WriteBackQueue:
         if outcome == "failed":
             if error is None:
                 error = WriteBackFailed(f"write-back failed: {detail} bucket={job.target.bucket_name}")
-            _capture(error, f"write_back:{job.target.bucket_name}:{kind}", interval=WRITE_BACK_SENTRY_MIN_INTERVAL)
+            _capture(error, ("write_back", job.target.identity, kind), interval=WRITE_BACK_SENTRY_MIN_INTERVAL)
 
     def join(self) -> None:
         self._queue.join()
