@@ -1,0 +1,71 @@
+# Runs the test suite against a throwaway MinIO server. Used by CI and locally:
+#
+#   docker compose -f docker-compose.test.yml run --rm --build tests
+#   docker compose -f docker-compose.test.yml down -v
+#
+# Nothing here needs a .env file or real credentials. The MinIO user and password below are
+# MinIO's well-known development defaults, which prism/tests/config/test_credentials.json also
+# uses, and the server only exists for the length of the test run. No ports are published, so
+# this stack can run next to the development one.
+
+name: prism-test
+
+x-minio-image: &minio-image
+  # Same pinned image as docker-compose.development.yml. It bundles the MinIO server, mc and a
+  # shell, and is built by the public repository https://github.com/RolnickLab/minio-image.
+  image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:1dca54196431cf11e745ebf743e1ceaa69f6d5a3070a6d8b068c7f5b0c981fa1
+
+x-s3-env: &s3-env
+  S3_ENDPOINT_URL: http://minio:9000
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+
+services:
+
+  minio:
+    <<: *minio-image
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  # Creates the buckets the tests read from and write to, then exits.
+  buckets:
+    <<: *minio-image
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment: *s3-env
+    volumes:
+      - ./compose/minio:/etc/minio:ro
+    entrypoint:
+      - /etc/minio/create_buckets.sh
+      - prism-test-credentials
+      - prism-test-source-mike
+      - prism-test-source-sara
+      - prism-test-thumbs-sara
+      - prism-test-write-back
+
+  tests:
+    build:
+      context: .
+    depends_on:
+      buckets:
+        condition: service_completed_successfully
+    environment:
+      <<: *s3-env
+      AWS_REGION: us-east-1
+      DOMAIN: localhost:8001
+      MULTI_CUSTOMER_MODE: "true"
+      SECRETS_BUCKET: prism-test-credentials
+      TEST_SECRETS_BUCKET: prism-test-credentials
+      S3_BUCKET: prism-test
+      # Enables the write-back tests that talk to a real S3-compatible server.
+      TEST_S3_ENDPOINT_URL: http://minio:9000
+      TEST_WRITE_BACK_BUCKET: prism-test-write-back
+    command: ["python", "-m", "unittest", "-v"]
