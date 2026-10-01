@@ -646,7 +646,8 @@ class WriteBackJob:
     content_length: Optional[int] = None
     # True when the read bucket had an empty or undecodable copy that should be replaced.
     replace_broken: bool = False
-    # ETag of that broken copy, so a copy that changed since it was read is left alone.
+    # ETag of that broken copy, so a copy that changed since it was read is left alone. When the
+    # broken copy was read without one, it is never replaced.
     broken_etag: Optional[str] = None
 
 
@@ -686,7 +687,10 @@ def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
             return "exists", "identical copy already present"
         if not job.replace_broken:
             return "exists", "a copy appeared since the read; left alone"
-        if job.broken_etag and existing_etag != _strip_etag(job.broken_etag):
+        if not job.broken_etag:
+            # Without it, a good copy written since the read would look the same as the broken one.
+            return "exists", "the broken copy was read without an ETag; left alone"
+        if existing_etag != _strip_etag(job.broken_etag):
             return "exists", "the broken copy changed since the read; left alone"
         outcome = "replaced-broken"
     elif head.status_code == 404:

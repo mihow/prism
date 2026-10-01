@@ -570,6 +570,17 @@ class TestWriteBack(OriginTestCase):
         })
         self.assertEqual(self.puts(), [])
 
+    def test_broken_copy_read_without_an_etag_is_left_alone(self):
+        # Without the ETag of the broken copy there is no way to tell whether the object HEAD
+        # now sees is still that copy or a good one written since, so nothing is overwritten.
+        self.run_write_back({
+            ("GET", "read"): response(200, b"garbage", {"Content-Type": "image/jpeg"}),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(200, etag=md5_hex(OTHER_JPEG), length=len(OTHER_JPEG)),
+        })
+        self.assertEqual(self.puts(), [])
+        self.assertTrue(any("write-back exists" in line and "without an ETag" in line for line in self.logs), self.logs)
+
     def test_undecodable_fallback_is_never_written(self):
         self.use_http({("GET", "read"): s3_error(404, "NoSuchKey"), ("GET", "fallback"): image(b"junk")})
         with self.assertRaises(BadRequest):
