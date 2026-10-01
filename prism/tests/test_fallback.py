@@ -179,6 +179,16 @@ CUSTOMER_B = dict(
     read_bucket_endpoint_url="https://ceph.example.org",
     write_bucket_name="thumbs-b",
 )
+# Customer b once it has its own fallback and write-back, with its own key.
+CUSTOMER_B_WITH_FALLBACK = dict(
+    CUSTOMER_B,
+    read_bucket_key_id="key-b",
+    read_bucket_secret_key="secret-b",
+    read_bucket_private=True,
+    fallback_bucket_name="fallback-b",
+    fallback_bucket_region="us-east-1",
+    fallback_write_back=True,
+)
 
 
 def multi_customer_store(default="a", **entries) -> CredentialsStore:
@@ -1112,6 +1122,98 @@ class TestMultiCustomer(OriginTestCase):
         self.assertEqual(here.identity, same.identity)
         self.assertNotEqual(origins.HttpOrigin("fallback", "https://a.example.net").identity,
                             origins.HttpOrigin("fallback", "https://b.example.net").identity)
+
+    def test_same_path_for_two_customers_is_written_to_each_customers_read_bucket(self):
+        # Both requests arrive before either copy runs, as concurrent requests in one worker do.
+        b_original = OTHER_JPEG
+        self.use_http({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("GET", "read-b"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback-b"): image(b_original),
+            ("HEAD", "read"): head(404),
+            ("HEAD", "read-b"): head(404),
+            ("PUT", "read"): response(200, b"", {"ETag": f'"{md5_hex(JPEG)}"'}),
+            ("PUT", "read-b"): response(200, b"", {"ETag": f'"{md5_hex(b_original)}"'}),
+        })
+        app = self.app(multi_customer_store(a=dict(CUSTOMER_A), b=dict(CUSTOMER_B_WITH_FALLBACK)))
+        barrier = threading.Barrier(2)
+        statuses = {}
+
+        def get(customer):
+            barrier.wait()
+            statuses[customer] = status_of(app.dispatch_request(customer_request(customer, cmd="info")))
+
+        threads = [threading.Thread(target=get, args=(c,)) for c in ("a", "b")]
+        with self.assertLogs("prism.origins", level="INFO"):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(statuses, {"a": 200, "b": 200})
+        self.assertEqual(self.queue._queue.qsize(), 2)
+        self.assertNotIn("write_back.already_queued", origins.STATS.snapshot())
+
+        with self.assertLogs("prism.origins", level="INFO"):
+            self.queue.run_pending()
+        puts = {c.origin: c for c in self.http.calls if c.method == "PUT"}
+        self.assertEqual(set(puts), {"read", "read-b"})
+        # Each customer's own fallback bytes, under the same key, in its own bucket, signed with its own key.
+        self.assertEqual(puts["read"].kwargs["data"], JPEG)
+        self.assertEqual(puts["read-b"].kwargs["data"], b_original)
+        for origin, bucket, key_id in (("read", "primary", "key-a"), ("read-b", "primary-b", "key-b")):
+            parsed = urllib.parse.urlparse(puts[origin].url)
+            self.assertEqual(parsed.path, f"/{bucket}/{PATH}")
+            self.assertEqual(urllib.parse.parse_qs(parsed.query)["AWSAccessKeyId"], [key_id])
+        self.assertEqual(origins.STATS.snapshot()["write_back.written"], 2)
+
+    def test_a_customers_request_reads_and_writes_only_its_own_buckets(self):
+        self.use_http({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("HEAD", "read"): head(404),
+            ("PUT", "read"): response(200),
+            ("GET", "read-b"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback-b"): image(),
+            ("HEAD", "read-b"): head(404),
+            ("PUT", "read-b"): response(200),
+        })
+        app = self.app(multi_customer_store(a=dict(CUSTOMER_A), b=dict(CUSTOMER_B_WITH_FALLBACK)))
+        for customer, own in (("a", {"read", "fallback"}), ("b", {"read-b", "fallback-b"})):
+            with self.subTest(customer=customer):
+                self.http.calls.clear()
+                with self.assertLogs("prism.origins", level="INFO"):
+                    self.assertEqual(status_of(app.dispatch_request(customer_request(customer, cmd="info"))), 200)
+                    self.queue.run_pending()
+                self.assertEqual({c.origin for c in self.http.calls}, own)
+
+    def test_customer_without_fallback_settings_next_to_one_with_them(self):
+        self.use_http({
+            ("GET", "read"): s3_error(404, "NoSuchKey"),
+            ("GET", "fallback"): image(),
+            ("GET", "read-b"): s3_error(404, "NoSuchKey"),
+        })
+        app = self.app()
+        self.assertEqual(status_of(app.dispatch_request(customer_request("a", cmd="info"))), 200)
+        # Customer b has no fallback: a miss is a 404, and customer a's fallback is not tried.
+        self.assertEqual(status_of(app.dispatch_request(customer_request("b", cmd="info"))), 404)
+        self.assertEqual(self.http.called(), [("GET", "read"), ("GET", "fallback"), ("GET", "read-b")])
+        # Only customer a's copy is queued.
+        self.assertEqual(self.queue._queue.qsize(), 1)
+        self.assertEqual(self.queue._queue.get_nowait().target.bucket_name, "primary")
+
+    def test_queue_de_duplicates_by_destination_and_key(self):
+        target_a = origins.WriteBackTarget("primary", "N/A", "https://ceph.example.org", "key-a", "secret-a")
+        target_b = origins.WriteBackTarget("primary-b", "N/A", "https://ceph.example.org", "key-b", "secret-b")
+        elsewhere = origins.WriteBackTarget("primary", "N/A", "https://other.example.org", "key-a", "secret-a")
+        job = lambda target: origins.WriteBackJob(target, PATH, JPEG, content_length=len(JPEG))  # noqa: E731
+        self.assertTrue(self.queue.submit(job(target_a)))
+        self.assertTrue(self.queue.submit(job(target_b)))
+        self.assertTrue(self.queue.submit(job(elsewhere)))
+        # The same destination and key again: already waiting.
+        self.assertFalse(self.queue.submit(job(origins.WriteBackTarget("primary", "N/A", "https://ceph.example.org",
+                                                                        "key-a", "secret-a"))))
+        self.assertEqual(self.queue._queue.qsize(), 3)
 
     def test_write_back_failures_are_reported_per_read_bucket(self):
         target_a = origins.WriteBackTarget("primary", "N/A", "https://ceph.example.org", "key-a", "secret-a")

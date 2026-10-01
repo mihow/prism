@@ -743,8 +743,10 @@ class WriteBackQueue:
 
     ``submit`` never blocks: when the queue is full, or the bytes waiting would exceed
     ``max_pending_bytes``, the job is dropped and logged; the next request for that original
-    reads the fallback again and queues it again. A key that is already waiting is not queued
-    twice. Threads start on first use in each process (uWSGI forks workers after import).
+    reads the fallback again and queues it again. A key that is already waiting for the same
+    read bucket (``WriteBackTarget.identity``) is not queued twice; the same key for another
+    customer's bucket is a separate copy. One queue serves every customer of the process.
+    Threads start on first use in each process (uWSGI forks workers after import).
     Jobs still waiting when a worker process exits are lost, which only costs a later re-read.
     """
 
@@ -758,14 +760,18 @@ class WriteBackQueue:
         self._lock = threading.Lock()
         self._pid: Optional[int] = None
         self._queue: "queue.Queue[WriteBackJob]" = queue.Queue(maxsize=max_items)
-        self._pending_keys: set = set()
+        self._pending: set = set()
         self._pending_bytes = 0
+
+    @staticmethod
+    def _destination(job: WriteBackJob) -> Tuple:
+        return (job.target.identity, job.key)
 
     def _ensure_started(self) -> None:
         if self._pid == os.getpid():
             return
         self._queue = queue.Queue(maxsize=self.max_items)
-        self._pending_keys = set()
+        self._pending = set()
         self._pending_bytes = 0
         self._pid = os.getpid()
         if self.autostart:
@@ -774,9 +780,10 @@ class WriteBackQueue:
 
     def submit(self, job: WriteBackJob) -> bool:
         size = len(job.data)
+        destination = self._destination(job)
         with self._lock:
             self._ensure_started()
-            if job.key in self._pending_keys:
+            if destination in self._pending:
                 self.stats.incr("write_back.already_queued")
                 return False
             if self._pending_bytes + size > self.max_pending_bytes:
@@ -787,7 +794,7 @@ class WriteBackQueue:
                 except queue.Full:
                     reason = "queue full"
                 else:
-                    self._pending_keys.add(job.key)
+                    self._pending.add(destination)
                     self._pending_bytes += size
                     self.stats.incr("write_back.queued")
                     return True
@@ -825,7 +832,7 @@ class WriteBackQueue:
             outcome, detail, error, kind = "failed", scrub(f"{type(e).__name__}: {e}"), e, type(e).__name__
         finally:
             with self._lock:
-                self._pending_keys.discard(job.key)
+                self._pending.discard(self._destination(job))
                 self._pending_bytes -= len(job.data)
             self._queue.task_done()
         level = logging.WARNING if outcome == "failed" else logging.INFO

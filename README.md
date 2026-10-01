@@ -169,6 +169,8 @@ threads after the response is sent: a slow or failing write never delays or fail
   worker process). When it is full the copy is dropped and logged; the next request for that
   original reads the fallback and queues it again. Jobs still queued when a worker process exits
   are lost the same way.
+- One queue per worker process serves every customer. A key already waiting for the same read
+  bucket is not queued twice; the same key for another customer's read bucket is its own copy.
 
 Each copy is logged on `prism.origins` with its outcome: `written`, `replaced-broken`, `exists`,
 `skipped` (the bytes could not be verified), `failed` (with the reason) or `dropped`. A `failed`
