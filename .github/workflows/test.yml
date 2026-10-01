@@ -5,10 +5,11 @@ on:
     branches: [main]
   pull_request:
 
-# A newer push to the same branch or pull request cancels the run it supersedes.
+# A newer push to a pull request cancels the run it supersedes. Runs on main are never cancelled,
+# so every commit that lands there gets a result.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
