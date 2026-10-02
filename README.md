@@ -166,8 +166,12 @@ threads after the response is sent: a slow or failing write never delays or fail
   `Content-MD5` and the fallback's `Content-Type`, and is conditional (`If-None-Match: *` for a
   missing key, `If-Match` with the broken copy's ETag for a replacement), so a copy written by
   someone else between the HEAD and the PUT is left alone. MinIO and Ceph RGW honour these
-  headers. A store that answers 501 to them gets an unconditional PUT instead, and a store that
-  ignores them is not protected against that race.
+  headers. The ETag in `If-Match` is sent without quotes, because Ceph RGW refuses the quoted
+  form even when it matches; MinIO accepts both, and AWS S3 documents both. When a replacement
+  is refused with 412, a second HEAD tells whether the broken copy was changed (left alone) or
+  removed (not recreated; Ceph RGW answers 412 rather than 404 for a removed key). A store that
+  answers 501 to the headers gets an unconditional PUT instead, and a store that ignores them is
+  not protected against that race.
 - Nothing is copied when the read bucket was unreachable rather than missing the file.
 - The queue is bounded (`WRITE_BACK_QUEUE_SIZE` jobs and `WRITE_BACK_MAX_PENDING_MB` of bytes per
   worker process). When it is full the copy is dropped and logged; the next request for that
@@ -177,8 +181,10 @@ threads after the response is sent: a slow or failing write never delays or fail
   bucket is not queued twice; the same key for another customer's read bucket is its own copy.
 
 Each copy is logged on `prism.origins` with its outcome: `written`, `replaced-broken`, `exists`,
-`skipped` (the bytes could not be verified), `failed` (with the reason) or `dropped`. A `failed`
-copy is also sent to Sentry, at most once per read bucket (told apart by endpoint, name and key, so
+`skipped` (the bytes could not be verified, or the broken copy was removed), `failed` (with the
+reason), `precondition-unsupported` (the store refused to replace a broken copy although its ETag
+matched, so the copy stays broken) or `dropped`. A `failed` or `precondition-unsupported` copy is
+logged as a warning and also sent to Sentry, at most once per read bucket (told apart by endpoint, name and key, so
 customers never share a limit) and kind of failure (for example
 `PUT 403 AccessDenied`) every five minutes per worker process, because a read bucket that refuses
 writes otherwise shows up only as continued fallback traffic.

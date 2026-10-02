@@ -349,8 +349,8 @@ class OriginMisconfigured(OriginError):
 class WriteBackFailed(Exception):
     """Sent to Sentry when the read bucket refused a write-back copy.
 
-    That is a HEAD or PUT answered with an error, or a stored ETag that does not match the bytes
-    sent. The message holds the bucket and the reason but not the key, so every failure of one
+    That is a HEAD or PUT answered with an error, a stored ETag that does not match the bytes
+    sent, or a replacement refused although the broken copy's ETag matched. The message holds the bucket and the reason but not the key, so every failure of one
     kind is grouped into one Sentry issue.
     """
 
@@ -695,10 +695,17 @@ def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
 
     The HEAD and the PUT are separate requests, so another worker or a bulk copy can write the
     key in between. The PUT is therefore conditional: ``If-None-Match: *`` when the key was
-    missing, ``If-Match: <ETag of the broken copy>`` when replacing one. A store that answers
-    412 had a new copy written meanwhile, which is left alone. A store that answers 501 does
-    not support conditional writes, and the PUT is repeated without the condition; a store
-    that ignores the headers behaves the same way, without the protection.
+    missing, ``If-Match: <ETag of the broken copy>`` when replacing one. The ETag is sent bare,
+    without quotes, because Ceph RGW refuses a quoted ETag with 412 even when it matches; MinIO
+    accepts both forms and AWS S3 documents both. A 412 to a missing-key write means a copy
+    appeared meanwhile, which is left alone. A 412 to a replacement is checked with a second
+    HEAD (see ``_after_refused_replacement``). A store that answers 501 does not support
+    conditional writes, and the PUT is repeated without the condition; a store that ignores the
+    headers behaves the same way, without the protection.
+
+    One more outcome, ``precondition-unsupported``, means the store refused the replacement
+    although the broken copy still has the ETag the PUT named: the copy stays broken, and the
+    queue reports it like a failure.
     """
     data = job.data
     if not data:
@@ -722,13 +729,18 @@ def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
             return "exists", "identical copy already present"
         if not job.replace_broken:
             return "exists", "a copy appeared since the read; left alone"
+        raw_etag = (head.headers.get("ETag") or "").strip()
+        if raw_etag.startswith("W/"):
+            # If-Match compares ETags strongly, so a weak one can never match.
+            return "exists", "the broken copy has a weak ETag; left alone"
         if not job.broken_etag:
             # Without it, a good copy written since the read would look the same as the broken one.
             return "exists", "the broken copy was read without an ETag; left alone"
         if existing_etag != _strip_etag(job.broken_etag):
             return "exists", "the broken copy changed since the read; left alone"
         outcome = "replaced-broken"
-        condition = {"If-Match": f'"{existing_etag}"'}
+        # The ETag exactly as the store reported it, minus the quotes (see the docstring).
+        condition = {"If-Match": raw_etag.strip('"')}
     elif head.status_code == 404:
         outcome = "written"
         condition = {"If-None-Match": "*"}
@@ -749,7 +761,7 @@ def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
     if put.status_code == 412:
         if outcome == "written":
             return "exists", "a copy appeared during the write; left alone"
-        return "exists", "the broken copy changed during the write; left alone"
+        return _after_refused_replacement(target, job.key, existing_etag)
     if put.status_code == 404 and outcome == "replaced-broken" and s3_error_code(put) == "NoSuchKey":
         return "skipped", "the broken copy was removed during the write"
     if put.status_code >= 300:
@@ -758,6 +770,31 @@ def write_back_one(job: WriteBackJob) -> Tuple[str, str]:
     if stored_etag and _MD5_ETAG_RE.match(stored_etag) and stored_etag != md5_hex:
         return "failed", "stored ETag does not match the bytes sent"
     return outcome, f"{len(data)} bytes{note}"
+
+
+def _after_refused_replacement(target: WriteBackTarget, key: str, broken_etag: str) -> Tuple[str, str]:
+    """Explain a 412 to the PUT that replaces a broken copy, so it is not mistaken for a race.
+
+    Most stores answer 412 when the copy changed and 404 when it was removed, but Ceph RGW
+    answers 412 to both. A second HEAD tells them apart: a removed copy is not recreated
+    (``skipped``), a changed one is left alone (``exists``), and an unchanged one means the
+    store refused an ETag that matched, which a retry would not fix
+    (``precondition-unsupported``).
+    """
+    head = _request(target, "HEAD", target.url(key, method="HEAD"))
+    if head.status_code == 404:
+        return "skipped", "the broken copy was removed during the write"
+    if head.status_code != 200:
+        return "failed", f"HEAD after a refused replacement {classify_status(target, head.status_code, None).reason}"
+    if _strip_etag(head.headers.get("ETag")) != broken_etag:
+        return "exists", "the broken copy changed during the write; left alone"
+    return ("precondition-unsupported",
+            "the store refused If-Match with the broken copy's current ETag; the copy stays broken")
+
+
+# Outcomes logged as warnings and sent to Sentry: the copy was not made and the next request for
+# the original reads the fallback again, which is otherwise invisible.
+_REPORTED_OUTCOMES = ("failed", "precondition-unsupported")
 
 
 class WriteBackQueue:
@@ -857,12 +894,12 @@ class WriteBackQueue:
                 self._pending.discard(self._destination(job))
                 self._pending_bytes -= len(job.data)
             self._queue.task_done()
-        level = logging.WARNING if outcome == "failed" else logging.INFO
+        level = logging.WARNING if outcome in _REPORTED_OUTCOMES else logging.INFO
         logger.log(level, "write-back %s: %s bucket=%s path=%s", outcome, detail, job.target.bucket_name, job.key)
         self.stats.incr(f"write_back.{outcome}")
-        if outcome == "failed":
+        if outcome in _REPORTED_OUTCOMES:
             if error is None:
-                error = WriteBackFailed(f"write-back failed: {detail} bucket={job.target.bucket_name}")
+                error = WriteBackFailed(f"write-back {outcome}: {detail} bucket={job.target.bucket_name}")
             _capture(error, ("write_back", job.target.identity, kind), interval=WRITE_BACK_SENTRY_MIN_INTERVAL)
 
     def join(self) -> None:
