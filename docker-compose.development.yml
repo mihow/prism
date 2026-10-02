@@ -21,7 +21,10 @@ services:
     command: [ "uwsgi", "--ini", "prism.uwsgi.development.ini" ]
 
   minio:
-    image: minio/minio
+    # The upstream minio/minio and minio/mc images can no longer be pulled anonymously. This image
+    # bundles the MinIO server, mc and a shell, and is pinned by digest. It is built by the public
+    # repository https://github.com/RolnickLab/minio-image; see it to move to a newer release.
+    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:1dca54196431cf11e745ebf743e1ceaa69f6d5a3070a6d8b068c7f5b0c981fa1
     command: server /data --console-address ':40283'
     ports:
       - "9000:9000"
@@ -34,7 +37,8 @@ services:
 
 
   minioclient:
-    image: minio/mc
+    # Same image as the minio service, for its bundled mc.
+    image: insectai/minio:RELEASE.2026-09-16T00-00-00Z@sha256:1dca54196431cf11e745ebf743e1ceaa69f6d5a3070a6d8b068c7f5b0c981fa1
     depends_on:
       - minio
     env_file:

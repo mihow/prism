@@ -10,7 +10,7 @@ import sentry_sdk
 from boto.s3.key import Key
 from requests import HTTPError
 from sentry_sdk.integrations.wsgi import SentryWsgiMiddleware
-from werkzeug.exceptions import BadRequest, HTTPException, NotFound
+from werkzeug.exceptions import BadGateway, BadRequest, HTTPException, InternalServerError, NotFound
 
 # from werkzeug.contrib.fixers import ProxyFix
 from werkzeug.middleware.proxy_fix import ProxyFix
@@ -20,11 +20,18 @@ from werkzeug.wrappers import Request, Response
 
 import prism.core as core
 import prism.settings as settings
+from prism import origins as prism_origins
 
-logging.basicConfig(level=logging.WARNING)
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "WARNING").upper())
+if settings.ORIGINS_LOG_LEVEL:
+    logging.getLogger("prism.origins").setLevel(settings.ORIGINS_LOG_LEVEL.upper())
+prism_origins.install_log_scrubbing()
 logger = logging.getLogger(__name__)
 
-sentry_sdk.init()  # uses SENTRY_DSN env var
+sentry_sdk.init(  # uses SENTRY_DSN env var
+    before_send=prism_origins.sentry_before_send,
+    before_breadcrumb=prism_origins.sentry_before_breadcrumb,
+)
 
 
 class App(object):
@@ -72,6 +79,10 @@ class App(object):
                 f"Customer '{subdomain}' not found. Request host: {request.host}"
             )
             raise NotFound()
+        except CustomerConfigError as e:
+            logger.error("Customer '%s' has an invalid configuration: %s", subdomain, e)
+            sentry_sdk.capture_exception()
+            raise InternalServerError("The customer configuration is invalid.")
         return customer
 
     def main(self, request):
@@ -86,15 +97,7 @@ class App(object):
 
         customer = self.get_customer(request)
         if extension == ".gif" and request.args.get("out", "gif") == "gif":
-            s3_url = core.get_s3_url(
-                customer.read_bucket_name,
-                customer.read_bucket_region,
-                path,
-                endpoint=customer.read_bucket_endpoint_url,
-            )
-            if core.check_s3_object_exists(s3_url):
-                return redirect(s3_url)
-            raise NotFound()
+            return gif_passthrough(path, customer)
 
         if args["command"] == "info":
             return info(path, args, customer)
@@ -111,21 +114,24 @@ class App(object):
         return Response(open("prism/static/test.html"), content_type="text/html")
 
     def elb_health_check(self, request):
-        # If HTTPError occurs or can't find the given image gives Response as 500
+        """200 when the default customer's TEST_IMAGE can be served, else 500.
+
+        The image is located with the same origin rules as a request (HEAD per origin, see
+        prism/origins.py): an instance that serves it from the fallback while the read bucket
+        lacks it or is down stays healthy, and a misconfigured read bucket makes it unhealthy
+        without consulting the fallback. Only the default customer is checked, so one other
+        customer's broken configuration cannot take every instance out of the load balancer.
+        """
+        if not settings.TEST_IMAGE:
+            logger.error("health check failed: TEST_IMAGE is not set")
+            return Response(status=500)
         customer = self.credentials_store.get_default_customer()
-        path = settings.TEST_IMAGE
-        url = core.get_s3_url(
-            customer.read_bucket_name,
-            customer.read_bucket_region,
-            path,
-            endpoint=customer.read_bucket_endpoint_url,
-        )
         try:
-            if core.check_s3_object_exists(url):
-                return Response("OK")
-        except HTTPError:
-            pass
-        return Response(status=500)
+            prism_origins.locate_original(settings.TEST_IMAGE, customer.origins())
+        except prism_origins.ReadFailed as e:
+            logger.warning("health check failed: %s", e)
+            return Response(status=500)
+        return Response("OK")
 
     def test_info(self, request):
         customer = self.credentials_store.get_default_customer()
@@ -167,19 +173,7 @@ class App(object):
 
 
 def info(path, args, customer):
-    url = core.get_s3_url(
-        customer.read_bucket_name,
-        customer.read_bucket_region,
-        path,
-        endpoint=customer.read_bucket_endpoint_url,
-    )
-    try:
-        im = core.fetch_image(url)
-    except HTTPError as e:
-        if e.response.status_code in (404, 403):
-            raise NotFound()
-        else:
-            raise
+    im = fetch_original(path, customer)
     info = core.info(im)
     return json_response(info)
 
@@ -198,17 +192,54 @@ def fetch_image(original_url):
         raise BadRequest(e.message)
 
 
+_READ_FAILED_EXCEPTIONS = {400: BadRequest, 404: NotFound, 502: BadGateway}
+
+
+def _http_exception(error: prism_origins.ReadFailed) -> HTTPException:
+    exception_class = _READ_FAILED_EXCEPTIONS.get(error.status, BadGateway)
+    if exception_class is NotFound:
+        return NotFound()
+    return exception_class(error.reason)
+
+
+def fetch_original(path, customer):
+    """Fetch an original image, trying the customer's origins in order.
+
+    The rules for when the next origin is tried are in prism/origins.py: a missing, empty or
+    undecodable original moves on quietly; an unreachable origin or a 5xx moves on loudly
+    (WARNING and Sentry); a misconfigured origin (NoSuchBucket, refused credentials) answers
+    502 without falling back. When no origin can serve the original the answer is 404 if it
+    is missing everywhere, 400 if a copy exists but is empty or not decodable, and 502 if an
+    origin could not be read.
+    """
+    try:
+        original = prism_origins.read_original(path, customer.origins(), write_back=customer.write_back_target())
+    except prism_origins.ReadFailed as e:
+        raise _http_exception(e)
+    return original.image
+
+
+def gif_passthrough(path, customer):
+    """Redirect to the original GIF on the first origin that has it, using the same rules.
+
+    A private origin is redirected to with a short-lived signed URL, so that redirect is
+    marked ``Cache-Control: no-store``; a cached copy would outlive the signature.
+    """
+    try:
+        origin = prism_origins.locate_original(path, customer.origins())
+    except prism_origins.ReadFailed as e:
+        raise _http_exception(e)
+    response = redirect(origin.url(path))
+    if origin.private:
+        response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 def process(path, args, customer):
     cmd = args["command"]
     options = args["options"]
-    original_url = core.get_s3_url(
-        customer.read_bucket_name,
-        customer.read_bucket_region,
-        path,
-        endpoint=customer.read_bucket_endpoint_url,
-    )
     if args["debug"]:
-        im = core.fetch_image(original_url)
+        im = fetch_original(path, customer)
         f = core.resize(im, cmd, options)
         r = Response(f, mimetype="image/jpeg", direct_passthrough=True)
         return r
@@ -222,7 +253,7 @@ def process(path, args, customer):
     exists = core.check_s3_object_exists(result_url)
     if args["with_info"] or args["force"] or not exists:
         clear_old_tmp_files()
-        im = fetch_image(original_url=original_url)
+        im = fetch_original(path, customer)
         f = core.resize(im.clone(), cmd, options)
         bucket_name = customer.write_bucket_name
         s3_config = core.S3ConnectionConfig(
@@ -434,6 +465,31 @@ def clear_old_tmp_files():
             pass
 
 
+class CustomerConfigError(ValueError):
+    """A customer's entry in credentials.json is inconsistent."""
+
+
+_TRUE_STRINGS = ("true", "1", "yes", "on")
+_FALSE_STRINGS = ("false", "0", "no", "off", "")
+
+
+def _as_bool(value, name):
+    """Read a boolean setting, accepting JSON booleans and the usual strings ("true", "0"...)."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in _TRUE_STRINGS:
+            return True
+        if lowered in _FALSE_STRINGS:
+            return False
+    raise CustomerConfigError(f"{name} must be true or false, got {value!r}")
+
+
 class Customer(object):
     def __init__(
         self,
@@ -447,6 +503,15 @@ class Customer(object):
         write_bucket_secret_key=None,
         write_bucket_region=None,
         write_bucket_endpoint_url=None,
+        read_bucket_private=False,
+        fallback_bucket_name=None,
+        fallback_bucket_key_id=None,
+        fallback_bucket_secret_key=None,
+        fallback_bucket_region=None,
+        fallback_bucket_endpoint_url=None,
+        fallback_bucket_private=False,
+        fallback_cdn_url=None,
+        fallback_write_back=False,
         **kwargs,
     ):
         self.read_bucket_name = read_bucket_name
@@ -461,6 +526,83 @@ class Customer(object):
         self.write_bucket_endpoint_url = (
             write_bucket_endpoint_url or read_bucket_endpoint_url
         )
+        self.read_bucket_private = _as_bool(read_bucket_private, "read_bucket_private")
+        # Optional second source of originals, tried when the read bucket does not have the
+        # file. Used while originals are migrated between buckets and only some are copied.
+        # It is either a bucket (fallback_bucket_*) or an HTTPS base URL such as a CDN in
+        # front of the old bucket (fallback_cdn_url), not both.
+        self.fallback_bucket_name = fallback_bucket_name
+        self.fallback_bucket_key_id = fallback_bucket_key_id
+        self.fallback_bucket_secret_key = fallback_bucket_secret_key
+        self.fallback_bucket_region = fallback_bucket_region
+        self.fallback_bucket_endpoint_url = fallback_bucket_endpoint_url
+        self.fallback_bucket_private = _as_bool(fallback_bucket_private, "fallback_bucket_private")
+        self.fallback_cdn_url = fallback_cdn_url
+        # Copy originals served by the fallback into the read bucket, in the background.
+        self.fallback_write_back = _as_bool(fallback_write_back, "fallback_write_back")
+        self._validate()
+
+    def _validate(self):
+        if self.read_bucket_private and not (self.read_bucket_key_id and self.read_bucket_secret_key):
+            raise CustomerConfigError("read_bucket_private requires read_bucket_key_id and read_bucket_secret_key")
+        if self.fallback_bucket_private and not (self.fallback_bucket_key_id and self.fallback_bucket_secret_key):
+            raise CustomerConfigError(
+                "fallback_bucket_private requires fallback_bucket_key_id and fallback_bucket_secret_key"
+            )
+        if self.fallback_bucket_name and self.fallback_cdn_url:
+            raise CustomerConfigError("set either fallback_bucket_name or fallback_cdn_url, not both")
+        if self.fallback_cdn_url and not str(self.fallback_cdn_url).startswith(("https://", "http://")):
+            raise CustomerConfigError("fallback_cdn_url must be an http(s) URL")
+        if self.fallback_write_back:
+            if not (self.fallback_bucket_name or self.fallback_cdn_url):
+                raise CustomerConfigError("fallback_write_back requires a fallback origin")
+            if not (self.read_bucket_key_id and self.read_bucket_secret_key):
+                raise CustomerConfigError("fallback_write_back requires read_bucket_key_id and read_bucket_secret_key")
+
+    def origins(self) -> List[object]:
+        """The origins to read originals from, in the order they are tried."""
+        result = [
+            prism_origins.S3Origin(
+                name="read",
+                bucket_name=self.read_bucket_name,
+                region=self.read_bucket_region,
+                endpoint_url=self.read_bucket_endpoint_url,
+                key_id=self.read_bucket_key_id,
+                secret_key=self.read_bucket_secret_key,
+                private=self.read_bucket_private,
+            )
+        ]
+        if self.fallback_bucket_name:
+            result.append(
+                prism_origins.S3Origin(
+                    name="fallback",
+                    bucket_name=self.fallback_bucket_name,
+                    region=self.fallback_bucket_region,
+                    endpoint_url=self.fallback_bucket_endpoint_url,
+                    key_id=self.fallback_bucket_key_id,
+                    secret_key=self.fallback_bucket_secret_key,
+                    private=self.fallback_bucket_private,
+                )
+            )
+        elif self.fallback_cdn_url:
+            result.append(prism_origins.HttpOrigin(name="fallback", base_url=self.fallback_cdn_url))
+        return result
+
+    def write_back_target(self) -> Optional[prism_origins.WriteBackTarget]:
+        """Where originals served by the fallback are copied to, or None when write-back is off."""
+        if not self.fallback_write_back:
+            return None
+        return prism_origins.WriteBackTarget(
+            bucket_name=self.read_bucket_name,
+            region=self.read_bucket_region,
+            endpoint_url=self.read_bucket_endpoint_url,
+            key_id=self.read_bucket_key_id,
+            secret_key=self.read_bucket_secret_key,
+        )
+
+
+# Kept for code that imported the origin class from here.
+Origin = prism_origins.S3Origin
 
 
 class CredentialsStore(object):

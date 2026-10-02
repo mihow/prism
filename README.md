@@ -111,8 +111,134 @@ WARNING: This file must not be publicly accessible!
 
 Note: `write_bucket_*` parameters may be included to separate read and write buckets.
 
+#### Private read buckets and a fallback origin
+Prism fetches originals with a plain GET, so by default the read bucket must allow public reads.
+Set `"read_bucket_private": true` to fetch originals with a short-lived signed URL made from the
+`read_bucket_key_id` and `read_bucket_secret_key` instead (both are then required). That key must be
+allowed to list the bucket: without list permission, S3-compatible stores answer a request for a
+missing key with 403 instead of 404, and Prism treats a 403 from a private bucket as refused
+credentials.
+
+A customer may also name a fallback origin that holds originals the read bucket does not have yet,
+for example while originals are migrated from one object store to another. The fallback is either a
+second bucket (`fallback_bucket_name`, plus the optional `fallback_bucket_region`,
+`fallback_bucket_endpoint_url`, `fallback_bucket_key_id`, `fallback_bucket_secret_key` and
+`fallback_bucket_private`) or an HTTP(S) base URL, such as a CDN distribution in front of the old
+bucket (`fallback_cdn_url`; Prism requests `<fallback_cdn_url>/<key>` anonymously). Set one or the
+other, not both.
+
+What Prism does depends on how the read bucket answers:
+
+| Read bucket answer | What Prism does |
+|---|---|
+| The original | Serves it; the fallback is not contacted |
+| 404 `NoSuchKey`, or 403 from a public bucket | Tries the fallback (logged at `INFO`) |
+| An original that is empty, shorter than its `Content-Length`, or not decodable as an image | Tries the fallback (logged at `INFO`) |
+| Connection error, timeout, 429 or 5xx, after one retry | Tries the fallback, loudly: a `WARNING` and a Sentry event (at most one event per bucket or CDN per minute and worker process; each customer's buckets are counted separately) |
+| 404 `NoSuchBucket`, 403 from a private bucket, a redirect, or any other 4xx | Answers 502 without trying the fallback, logged at `ERROR` and sent to Sentry, so a misconfigured read bucket does not quietly send every request to the fallback |
+
+A CDN fallback (`fallback_cdn_url`) follows the same rules, except that it answers a missing key
+with 404, so any other error status from it is logged at `WARNING` with the status and the first
+200 characters of the response body. A 403 from the CDN, which usually means an origin policy, a
+firewall rule or an error page rather than a missing file, is still answered with 404 to the client.
+
+When no origin can serve the original, Prism answers 404 if it is missing everywhere, 400 if a copy
+exists but is empty or not decodable (with the same messages as before), and 502 if an origin could
+not be read. Decoding does not catch every damaged file: ImageMagick decodes a JPEG that is cut
+short, so a truncated copy in the read bucket is served as it is.
+
+The GIF passthrough (`.gif` requested without `out=`) follows the same rules with a HEAD request
+and redirects to the origin that has the file. A HEAD response has no body, so after a 404 Prism
+sends a one-byte GET to read the S3 error code; a missing bucket then answers 502 here too. A redirect to a private bucket carries a signed URL
+and is sent with `Cache-Control: no-store`.
+
+#### Copying fallback reads into the read bucket
+With `"fallback_write_back": true`, an original that was served by the fallback is copied into the
+read bucket under the same key, so the next request for it does not reach the fallback again. The
+copy uses the read bucket's key and secret (so both are required), and it happens in background
+threads after the response is sent: a slow or failing write never delays or fails a request.
+
+- Only the original bytes are copied, never a resized image, and only when they decoded as an
+  image, their length matches the fallback's `Content-Length`, and their MD5 matches the fallback's
+  `ETag` when that ETag is a plain MD5 (single-part uploads).
+- A copy already in the read bucket is left alone, unless it is the empty or undecodable copy that
+  was just read there, which is replaced. The check is a HEAD before the PUT; the PUT carries
+  `Content-MD5` and the fallback's `Content-Type`, and is conditional (`If-None-Match: *` for a
+  missing key, `If-Match` with the broken copy's ETag for a replacement), so a copy written by
+  someone else between the HEAD and the PUT is left alone. MinIO and Ceph RGW honour these
+  headers. The ETag in `If-Match` is sent without quotes, because Ceph RGW refuses the quoted
+  form even when it matches; MinIO accepts both, and AWS S3 documents both. When a replacement
+  is refused with 412, a second HEAD tells whether the broken copy was changed (left alone) or
+  removed (not recreated; Ceph RGW answers 412 rather than 404 for a removed key). A store that
+  answers 501 to the headers gets an unconditional PUT instead, and a store that ignores them is
+  not protected against that race.
+- Nothing is copied when the read bucket was unreachable rather than missing the file.
+- The queue is bounded (`WRITE_BACK_QUEUE_SIZE` jobs and `WRITE_BACK_MAX_PENDING_MB` of bytes per
+  worker process). When it is full the copy is dropped and logged; the next request for that
+  original reads the fallback and queues it again. Jobs still queued when a worker process exits
+  are lost the same way.
+- One queue per worker process serves every customer. A key already waiting for the same read
+  bucket is not queued twice; the same key for another customer's read bucket is its own copy.
+
+Each copy is logged on `prism.origins` with its outcome: `written`, `replaced-broken`, `exists`,
+`skipped` (the bytes could not be verified, or the broken copy was removed), `failed` (with the
+reason), `precondition-unsupported` (the store refused to replace a broken copy although its ETag
+matched, so the copy stays broken) or `dropped`. A `failed` or `precondition-unsupported` copy is
+logged as a warning and also sent to Sentry, at most once per read bucket (told apart by endpoint, name and key, so
+customers never share a limit) and kind of failure (for example
+`PUT 403 AccessDenied`) every five minutes per worker process, because a read bucket that refuses
+writes otherwise shows up only as continued fallback traffic.
+
+#### Origin logging and settings
+Everything about origins is logged on the `prism.origins` logger. Set `ORIGINS_LOG_LEVEL=INFO` to see
+which origin served each original, and each copy, without raising `LOG_LEVEL` for everything else.
+Each worker process also logs its counters (originals served per origin, misses, bytes read from
+the fallback, write-back outcomes) at most every `ORIGIN_STATS_INTERVAL` seconds, for example
+`origin stats pid=12 fallback.bytes=36864000 read.missing=40 served.fallback=40 served.read=960 write_back.written=38 ...`.
+`fallback.bytes` is the total size of the originals the fallback served, for a fallback billed by
+transfer; it does not include failed or undecodable reads.
+Signed-URL signatures and access key ids are redacted from these logs, from urllib3's retry
+warnings and from Sentry events.
+
+| Environment variable | Default | Meaning |
+|---|---|---|
+| `ORIGIN_CONNECT_TIMEOUT` | `3` | Seconds to wait for a connection to an origin |
+| `ORIGIN_READ_TIMEOUT` | `5` | Seconds to wait between bytes from an origin |
+| `ORIGIN_RETRIES` | `1` | Retries per origin request on connection errors, timeouts and 500/502/503/504 |
+| `ORIGINS_LOG_LEVEL` | unset | Level for the `prism.origins` logger alone |
+| `ORIGIN_STATS_INTERVAL` | `300` | Seconds between counter log lines per worker process |
+| `WRITE_BACK_WORKERS` | `2` | Background copy threads per worker process |
+| `WRITE_BACK_QUEUE_SIZE` | `64` | Copies waiting per worker process |
+| `WRITE_BACK_MAX_PENDING_MB` | `256` | Bytes waiting per worker process |
+
+Existing customers see two differences: an origin that answers 5xx or cannot be reached now gives
+502 instead of an unhandled 500, and origin requests are retried once instead of five times.
+
+```
+{
+    "foo": {
+        "read_bucket_name": "foo-originals",
+        "read_bucket_endpoint_url": "https://ceph.example.org",
+        "read_bucket_region": "N/A",
+        "read_bucket_key_id": "...",
+        "read_bucket_secret_key": "...",
+        "read_bucket_private": true,
+        "write_bucket_name": "foo-thumbnails",
+        "fallback_cdn_url": "https://d111111abcdef8.cloudfront.net",
+        "fallback_write_back": true
+    }
+}
+```
+
 ### TEST_IMAGE
 The TEST_IMAGE setting is used to provide an image to be used for the test and health check endpoints. In multi customer mode the DEFAULT_CUSTOMER setting must also be set for the test endpoints to work.
+
+The health check (`/elb-health/`) answers 200 when the default customer's TEST_IMAGE can be served
+under the origin rules above, checked with HEAD requests: a test image that only the fallback holds,
+or a read bucket that is down while the fallback works, still counts as healthy (the outage is
+logged and sent to Sentry as for any request), while a misconfigured read bucket answers 500. Other
+customers are not checked, so one customer's broken entry cannot take every instance out of the
+load balancer. Each check counts as a served original in the origin counters.
 
 ### uWSGI Configuration
 

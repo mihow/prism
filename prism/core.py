@@ -142,7 +142,8 @@ def split_endpoint_url(endpoint_url: str) -> typing.Tuple[str, int, bool]:
 class S3ConnectionConfig:
     """Config for connecting to S3 with fallback to environment variables."""
     key_id: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_ACCESS_KEY_ID'))
-    secret_key: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_SECRET_ACCESS_KEY'))
+    # repr=False keeps the secret out of logs and out of Sentry's captured local variables.
+    secret_key: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_SECRET_ACCESS_KEY'), repr=False)
     region: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'AWS_REGION'))
     endpoint_url: typing.Optional[str] = field(default_factory=partial(os.environ.get, 'S3_ENDPOINT_URL'))
 
@@ -182,15 +183,21 @@ def get_s3_client(config: typing.Optional[S3ConnectionConfig] = None) -> boto.s3
 def get_s3_url(bucket_name, bucket_region, path, endpoint=None):
     """Get the public URL for an S3 object.
 
-    @TODO simplify this when boto v2 is updated to boto v3 
+    The key is percent-encoded, keeping ``/``, so the URL names exactly the stored object: a raw
+    ``#`` or ``?`` would otherwise end the path, and ``+`` would be ambiguous. The URL is used to
+    read originals from a public origin, to check whether a resized image already exists, and as
+    the redirect sent to the client.
+
+    @TODO simplify this when boto v2 is updated to boto v3
     @TODO shouldn't this use signed urls or pull from the bucket directly?
     """
+    path = urllib.parse.quote(path.lstrip("/"), safe="/")
 
     if endpoint:
         url = '{endpoint}/{bucket}/{path}'.format(
             endpoint=endpoint.rstrip("/"),
             bucket=bucket_name,
-            path=path.lstrip("/")
+            path=path
         )
     else:
         # we use region specific urls because s3 virtual hosts don't work with https
@@ -206,10 +213,30 @@ def get_s3_url(bucket_name, bucket_region, path, endpoint=None):
     return url
 
 
+def get_signed_s3_url(
+    bucket_name: str,
+    path: str,
+    s3_config: S3ConnectionConfig,
+    method: str = 'GET',
+    expires_in: int = 300,
+    headers: typing.Optional[typing.Dict[str, str]] = None,
+) -> str:
+    """Get a short-lived signed URL for an object in a private bucket.
+
+    Private buckets (for example a Ceph bucket without public-read) return 403 or 404 to the
+    anonymous requests that fetch_image and check_s3_object_exists make, so their originals
+    must be read with a signed URL. The signature covers the HTTP method, so a URL signed for
+    GET cannot be used for HEAD. For a PUT, pass the Content-Type and Content-MD5 headers the
+    request will carry: they are part of the signature, and the request must send the same values.
+    """
+    conn = get_s3_client(s3_config)
+    return conn.generate_url(expires_in, method, bucket=bucket_name, key=path.lstrip('/'), headers=headers)
+
+
 def fetch_image(url):
     s = requests.Session()
     s.mount('https://', HTTPAdapter(max_retries=retries))
-    print(f"Fetching {url}")
+    logger.debug("Fetching %s", url.split('?')[0])  # the query string may hold a signature
     r = s.get(url, timeout=5.0)
     t = r.elapsed.total_seconds()
     logging.info('S3 GET request time: %0.2f', t)
