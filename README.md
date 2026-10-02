@@ -256,3 +256,14 @@ The `8000` port of the container is mapped to the `8001` port of the host. Use `
 
 `http://localhost:8001/test`. This test url runs the same command both on your local and the live Prism server, and provides comparisons between local and live prism server image resizing operations. 
 
+## Running the tests
+
+The test suite runs in Docker against a throwaway MinIO server, so it needs no `.env` file or real credentials. The GitHub Actions workflow in `.github/workflows/test.yml` runs the same compose file in separate build, start and test steps. To run the tests locally:
+
+```
+docker compose -f docker-compose.test.yml run --rm --build tests
+docker compose -f docker-compose.test.yml down -v
+```
+
+The second command stops MinIO and removes its data afterwards.
+
