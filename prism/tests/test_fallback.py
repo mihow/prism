@@ -1584,6 +1584,81 @@ class TestVariantRedirect(unittest.TestCase):
                     self.assertIn(encoded.rsplit("/", 1)[-1].rsplit(".", 1)[0], parsed.path)
 
 
+class TestLocalCache(unittest.TestCase):
+    """Degraded mode: variants that cannot be stored remotely are served from local disk."""
+
+    ARGS = TestVariantRedirect.ARGS
+
+    def setUp(self):
+        import tempfile
+
+        from prism import app as app_module, settings
+
+        self.app_module = app_module
+        self.dir = tempfile.mkdtemp()
+        patches = [
+            mock.patch.object(settings, "LOCAL_CACHE_DIR", self.dir),
+            mock.patch.object(settings, "SKIP_REMOTE_WRITE", False),
+            mock.patch.object(core, "check_s3_object_exists", return_value=False),
+            mock.patch.object(core, "upload_file"),
+            mock.patch.object(app_module, "fetch_original", side_effect=lambda path, customer: Image(blob=JPEG)),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        self.settings = settings
+        self.customer = make_customer(write_bucket_endpoint_url="https://s3.example.org")
+
+    def run_process(self, key=PATH, **args):
+        return process(key, dict(self.ARGS, **args), self.customer)
+
+    def test_skip_remote_write_serves_new_variant_from_local_disk(self):
+        self.settings.SKIP_REMOTE_WRITE = True
+        resp = self.run_process()
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.mimetype, "image/jpeg")
+        self.assertTrue(resp.get_data().startswith(b"\xff\xd8"))
+        core.upload_file.assert_not_called()
+        expected = os.path.join(self.dir, core.get_thumb_filename(PATH, "resize", self.ARGS["options"]))
+        self.assertTrue(os.path.exists(expected))
+
+    def test_second_request_is_served_from_disk_without_reading_the_original(self):
+        self.settings.SKIP_REMOTE_WRITE = True
+        first = self.run_process().get_data()
+        self.app_module.fetch_original.reset_mock()
+        core.check_s3_object_exists.reset_mock()
+        second = self.run_process()
+        self.assertEqual(second.get_data(), first)
+        self.app_module.fetch_original.assert_not_called()
+        core.check_s3_object_exists.assert_not_called()
+
+    def test_failed_upload_falls_back_to_local_disk(self):
+        core.upload_file.side_effect = RuntimeError("object store refused the write")
+        resp = self.run_process()
+        self.assertEqual(resp.status_code, 200)
+        core.upload_file.assert_called_once()
+
+    def test_failed_upload_without_a_cache_dir_still_fails(self):
+        self.settings.LOCAL_CACHE_DIR = None
+        core.upload_file.side_effect = RuntimeError("object store refused the write")
+        with self.assertRaises(RuntimeError):
+            self.run_process()
+
+    def test_successful_upload_still_redirects(self):
+        resp = self.run_process()
+        self.assertEqual(resp.status_code, 302)
+
+    def test_existing_remote_variant_still_redirects(self):
+        core.check_s3_object_exists.return_value = True
+        resp = self.run_process()
+        self.assertEqual(resp.status_code, 302)
+        self.app_module.fetch_original.assert_not_called()
+
+    def test_paths_cannot_escape_the_cache_dir(self):
+        with self.assertRaises(BadRequest):
+            self.app_module.local_cache_path("../../etc/passwd")
+
+
 class TestStats(unittest.TestCase):
     def test_counters_are_logged_periodically_on_the_origins_logger(self):
         stats = origins.OriginStats(interval=0)

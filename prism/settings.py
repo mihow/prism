@@ -26,3 +26,14 @@ ORIGIN_STATS_INTERVAL = float(os.environ.get('ORIGIN_STATS_INTERVAL', '300'))
 WRITE_BACK_WORKERS = int(os.environ.get('WRITE_BACK_WORKERS', '2'))
 WRITE_BACK_QUEUE_SIZE = int(os.environ.get('WRITE_BACK_QUEUE_SIZE', '64'))
 WRITE_BACK_MAX_PENDING_MB = int(os.environ.get('WRITE_BACK_MAX_PENDING_MB', '256'))
+
+# Degraded mode for when the write bucket cannot be written to (for example, an object store
+# whose authentication service is down while anonymous reads still work). With LOCAL_CACHE_DIR
+# set, a newly made variant that cannot be stored remotely is kept on local disk and served from
+# there, instead of the request failing. SKIP_REMOTE_WRITE stops even trying the remote upload,
+# so new variants are answered as soon as they are made. Both default to off.
+LOCAL_CACHE_DIR = os.environ.get('PRISM_LOCAL_CACHE_DIR') or None
+SKIP_REMOTE_WRITE = os.environ.get('PRISM_SKIP_REMOTE_WRITE', 'false').lower() == 'true'
+# Optional fallback for originals in single-customer mode (the multi-customer mode reads it
+# from each customer's entry instead).
+FALLBACK_CDN_URL = os.environ.get('FALLBACK_CDN_URL') or None

@@ -250,19 +250,39 @@ def process(path, args, customer):
         result_path,
         endpoint=customer.write_bucket_endpoint_url,
     )
+    local_path = local_cache_path(result_path)
+    regenerate = args["with_info"] or args["force"]
+    if local_path and not regenerate and os.path.exists(local_path):
+        return serve_local(local_path, result_path)
     exists = core.check_s3_object_exists(result_url)
-    if args["with_info"] or args["force"] or not exists:
+    if regenerate or not exists:
         clear_old_tmp_files()
         im = fetch_original(path, customer)
         f = core.resize(im.clone(), cmd, options)
-        bucket_name = customer.write_bucket_name
-        s3_config = core.S3ConnectionConfig(
-            key_id=customer.write_bucket_key_id,
-            region=customer.write_bucket_region,
-            secret_key=customer.write_bucket_secret_key,
-            endpoint_url=customer.write_bucket_endpoint_url,
-        )
-        core.upload_file(bucket_name, s3_config, f, result_path)
+        stored_remotely = False
+        if not (local_path and settings.SKIP_REMOTE_WRITE):
+            bucket_name = customer.write_bucket_name
+            s3_config = core.S3ConnectionConfig(
+                key_id=customer.write_bucket_key_id,
+                region=customer.write_bucket_region,
+                secret_key=customer.write_bucket_secret_key,
+                endpoint_url=customer.write_bucket_endpoint_url,
+            )
+            try:
+                core.upload_file(bucket_name, s3_config, f, result_path)
+                stored_remotely = True
+            except Exception:
+                if not local_path:
+                    raise
+                logger.warning("could not store %s remotely; keeping it on local disk", result_path, exc_info=True)
+        if not stored_remotely:
+            f.seek(0)
+            save_local(local_path, f.read())
+            if args["with_info"]:
+                info = core.info(im)
+                info["url"] = None
+                return json_response(info)
+            return serve_local(local_path, result_path)
         if args["with_info"]:
             info = core.info(im)
             info["url"] = result_url
@@ -286,6 +306,41 @@ def process(path, args, customer):
         return Response(im, mimetype="image/*", direct_passthrough=True)
     else:
         return redirect(result_url)
+
+
+def local_cache_path(result_path: str) -> Optional[str]:
+    """Where a variant is kept on local disk in degraded mode, or None when that is off.
+
+    The variant's key never escapes the cache directory: absolute paths and `..` segments are
+    refused rather than resolved.
+    """
+    if not settings.LOCAL_CACHE_DIR:
+        return None
+    root = os.path.realpath(settings.LOCAL_CACHE_DIR)
+    candidate = os.path.realpath(os.path.join(root, result_path.lstrip("/")))
+    if not candidate.startswith(root + os.sep):
+        raise BadRequest("invalid image path")
+    return candidate
+
+
+def save_local(local_path: str, data: bytes) -> None:
+    """Write a variant atomically, so a concurrent reader never sees a partial file."""
+    os.makedirs(os.path.dirname(local_path), exist_ok=True)
+    tmp = "%s.%d.tmp" % (local_path, os.getpid())
+    with open(tmp, "wb") as fh:
+        fh.write(data)
+    os.replace(tmp, local_path)
+
+
+def serve_local(local_path: str, result_path: str) -> Response:
+    extension = result_path.rsplit(".", 1)[-1].lower()
+    mimetype = "image/jpeg" if extension in ("jpg", "jpeg") else "image/%s" % extension
+    with open(local_path, "rb") as fh:
+        data = fh.read()
+    response = Response(data, mimetype=mimetype)
+    # Short, so browsers ask again (and get the remote copy) once remote storage is back.
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
 
 
 def make_bool(x):
@@ -674,6 +729,7 @@ elif settings.S3_BUCKET:
             "read_bucket_secret_key": settings.AWS_SECRET_ACCESS_KEY,
             "read_bucket_endpoint_url": settings.S3_ENDPOINT_URL,
             "write_bucket_name": settings.S3_WRITE_BUCKET or settings.S3_BUCKET,
+            "fallback_cdn_url": settings.FALLBACK_CDN_URL,
         }
     )
 else:
